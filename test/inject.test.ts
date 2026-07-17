@@ -7,6 +7,7 @@ import {
 	defaultServerRequestResponse,
 	isValidServerResult,
 	type ServerRequest,
+	type ServerRequestHandlers,
 	type Transport,
 } from "../src/adapter/codex-client.js";
 import { injectWake } from "../src/adapter/inject.js";
@@ -153,7 +154,7 @@ describe("codex-client inject", () => {
 	it("steer fails without a recoverable id -> falls back to turn/start", async () => {
 		const { client, sent } = await startedClient({
 			"turn/start": confirmingTurnStart(),
-			"turn/steer": () => ({ error: { code: -32600, message: "no active turn" } }),
+			"turn/steer": () => ({ error: { code: -32600, message: "no active turn to steer" } }),
 		});
 		const threadId = await client.startThread();
 		await client.inject(threadId, "first");
@@ -210,6 +211,14 @@ describe("codex-client multi-thread turn tracking (P1#2)", () => {
 		expect(outcome.mode).toBe("turn/steer");
 		const aSteer = sent.filter((r) => r.method === "turn/steer" && r.params.threadId === "A").at(-1);
 		expect(aSteer.params.expectedTurnId).toBe("turn_A");
+
+		// next-idle ownership: B's NEXT wake (after its completion) must be a fresh turn/start,
+		// not a stale steer of the completed turn_B.
+		const bStartsBefore = sent.filter((r) => r.method === "turn/start" && r.params.threadId === "B").length;
+		const bOutcome = await client.inject("B", "b2");
+		expect(bOutcome.mode).toBe("turn/start");
+		expect(sent.filter((r) => r.method === "turn/start" && r.params.threadId === "B").length).toBe(bStartsBefore + 1);
+		expect(sent.some((r) => r.method === "turn/steer" && r.params.threadId === "B")).toBe(false);
 	});
 });
 
@@ -312,14 +321,54 @@ describe("codex-client server request handling (P1#3)", () => {
 		expect(resp.result).toBeUndefined();
 	});
 
-	it("isValidServerResult enforces each method's schema (unit)", () => {
+	it("KILLING: a handler returning a schema-invalid NESTED user-input shape is rejected", async () => {
+		const { client, sent, emit } = await startedClient({});
+		client.onServerRequest({
+			// answers values must be { answers: string[] }; a bare string is schema-invalid
+			"item/tool/requestUserInput": (async () => ({ answers: { q1: "not-an-answer" } })) as never,
+		});
+		emit({ id: 1002, method: "item/tool/requestUserInput", params: {} });
+		await new Promise((r) => setTimeout(r, 0));
+		const resp = sent.find((m) => m.id === 1002);
+		expect(resp.error, "deep-invalid answer shape must be rejected, not forwarded").toBeDefined();
+		expect(resp.result).toBeUndefined();
+	});
+
+	it("isValidServerResult enforces each method's EXACT schema incl. nested + extra keys (unit)", () => {
+		// command/file approval
 		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: "decline" })).toBe(true);
-		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: "approved" })).toBe(false); // wrong enum
-		expect(isValidServerResult("item/tool/requestUserInput", { answers: {} })).toBe(true);
-		expect(isValidServerResult("item/tool/requestUserInput", { decision: "decline" })).toBe(false); // cross-method
+		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: "approved" })).toBe(false); // wrong enum (review, not approval)
+		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: "decline", extra: 1 })).toBe(false); // extra key
+		// exec/patch review
 		expect(isValidServerResult("execCommandApproval", { decision: "denied" })).toBe(true);
+		expect(isValidServerResult("execCommandApproval", { decision: "decline" })).toBe(false); // approval enum, not review
+		// user-input: nested { answers: { [q]: { answers: string[] } } }
+		expect(isValidServerResult("item/tool/requestUserInput", { answers: {} })).toBe(true);
+		expect(isValidServerResult("item/tool/requestUserInput", { answers: { q: { answers: ["a"] } } })).toBe(true);
+		expect(isValidServerResult("item/tool/requestUserInput", { answers: { q: "a" } })).toBe(false); // value not {answers:[]}
+		expect(isValidServerResult("item/tool/requestUserInput", { answers: { q: { answers: [1] } } })).toBe(false); // non-string
+		expect(isValidServerResult("item/tool/requestUserInput", { answers: { q: { answers: ["a"], x: 1 } } })).toBe(false); // extra nested key
+		expect(isValidServerResult("item/tool/requestUserInput", { decision: "decline" })).toBe(false); // cross-method
+		// elicitation
 		expect(isValidServerResult("mcpServer/elicitation/request", { action: "decline" })).toBe(true);
-		expect(isValidServerResult("item/permissions/requestApproval", { permissions: {} })).toBe(false); // never
+		expect(isValidServerResult("mcpServer/elicitation/request", { action: "nope" })).toBe(false); // bad enum
+		// never-methods
+		expect(isValidServerResult("item/permissions/requestApproval", { permissions: {} })).toBe(false);
+	});
+
+	it("COMPILE negative controls: cross-method result / params are type errors", async () => {
+		// @ts-expect-error — a user-input handler must not be allowed to return a command decision
+		const badResult: ServerRequestHandlers = { "item/tool/requestUserInput": async () => ({ decision: "decline" }) };
+		const badParams: ServerRequestHandlers = {
+			"item/tool/requestUserInput": async (req) => {
+				// @ts-expect-error — user-input params have no `command` field (that's a command-approval field)
+				const _cmd: unknown = req.params.command;
+				void _cmd;
+				return { answers: {} };
+			},
+		};
+		void badResult;
+		void badParams;
 	});
 });
 
@@ -393,11 +442,18 @@ describe("codex-client CAS recovery state convergence (P2#2)", () => {
 // P1#2 (steer error classification): only a confirmed "no active turn" may fall back to
 // turn/start; a terminal/internal error must reject (never double-inject via a second turn).
 describe("codex-client steer error classification (P1#2)", () => {
-	it("classifySteerError distinguishes cas-retry / no-active-turn / terminal (unit)", () => {
-		expect(classifySteerError({ message: "expected active turn id `a` but found `b`" })).toBe("cas-retry");
-		expect(classifySteerError({ message: "no active turn to steer" })).toBe("no-active-turn");
-		expect(classifySteerError({ code: -32000, message: "internal error" })).toBe("terminal");
+	it("classifySteerError requires -32600 + exact anchored message; everything else terminal (unit)", () => {
+		expect(classifySteerError({ code: -32600, message: "expected active turn id `a` but found `b`" })).toBe("cas-retry");
+		expect(classifySteerError({ code: -32600, message: "no active turn to steer" })).toBe("no-active-turn");
+		// SPOOF: internal error whose message merely contains "no active turn" must NOT be trusted
+		expect(classifySteerError({ code: -32000, message: "internal boom: no active turn cache is corrupt" })).toBe("terminal");
+		// right-looking message but wrong code
+		expect(classifySteerError({ code: -32000, message: "no active turn to steer" })).toBe("terminal");
+		// -32600 but unanchored / trailing content → terminal (exact match only)
+		expect(classifySteerError({ code: -32600, message: "no active turn to steer (retry later)" })).toBe("terminal");
+		// timeout / disconnect
 		expect(classifySteerError({ code: -2, message: "request turn/steer timed out" })).toBe("terminal");
+		expect(classifySteerError({ code: -1, message: "transport disconnected" })).toBe("terminal");
 	});
 
 	it("KILLING: terminal steer error rejects and does NOT start a second turn (no double-inject)", async () => {
@@ -428,6 +484,69 @@ describe("codex-client steer error classification (P1#2)", () => {
 		expect(startsAfter).toBe(startsBefore); // NO second turn/start — no double injection
 		expect(client.pendingDeliveryCount()).toBe(0);
 	});
+
+	it("KILLING: real steer TIMEOUT rejects (no 2nd start, 0 waiters) and a late completion for the timed-out attempt confirms nothing", async () => {
+		let opened = false;
+		const steerClientIds: string[] = [];
+		const { client, sent, emit } = await startedClient(
+			{
+				"turn/start": (req, emit) => {
+					if (!opened) {
+						opened = true;
+						emit({ method: "turn/started", params: { threadId: req.params.threadId, turn: { id: "turn_1" } } });
+						emit({
+							method: "item/completed",
+							params: {
+								threadId: req.params.threadId,
+								turnId: "turn_1",
+								item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
+							},
+						});
+						return { result: { turn: { id: "turn_1" } } };
+					}
+					return { result: { turn: { id: "turn_bad" } } }; // an erroneous 2nd turn, must NOT happen
+				},
+				// first steer never responds → RPC times out (code -2) → terminal → reject;
+				// later steers confirm normally.
+				"turn/steer": (req, emit) => {
+					steerClientIds.push(req.params.clientUserMessageId);
+					if (steerClientIds.length === 1) return undefined; // timeout the first
+					emit({
+						method: "item/completed",
+						params: {
+							threadId: req.params.threadId,
+							turnId: req.params.expectedTurnId,
+							item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
+						},
+					});
+					return { result: {} };
+				},
+			},
+			{ requestTimeoutMs: 40 },
+		);
+		await client.inject("T", "first"); // opens turn_1
+		const startsBefore = sent.filter((r) => r.method === "turn/start").length;
+		await expect(client.inject("T", "second", { deliveryTimeoutMs: 500 })).rejects.toThrow(/terminal, no fallback/);
+		expect(sent.filter((r) => r.method === "turn/start").length).toBe(startsBefore); // no 2nd start
+		expect(client.pendingDeliveryCount()).toBe(0); // waiter cancelled on the terminal timeout
+
+		// A LATE completion arrives for the timed-out steer attempt's client id — must confirm nothing.
+		emit({
+			method: "item/completed",
+			params: {
+				threadId: "T",
+				turnId: "turn_1",
+				item: { type: "userMessage", clientId: steerClientIds.at(-1), content: [] },
+			},
+		});
+		await new Promise((r) => setTimeout(r, 0));
+		expect(client.pendingDeliveryCount()).toBe(0);
+
+		// A subsequent legitimate wake is confirmed ONLY by its own new client id.
+		const outcome = await client.inject("T", "third");
+		expect(outcome.delivered).toBe(true);
+		expect(outcome.mode).toBe("turn/steer"); // turn_1 still active → steer, its own completion confirms
+	});
 });
 
 // P2#3 regression: terminal RPC failure must not leak the delivery waiter/timer.
@@ -457,7 +576,7 @@ describe("codex-client delivery waiter cleanup (P2#3)", () => {
 				}
 				return { error: { code: -32000, message: "start boom" } }; // fallback start fails
 			},
-			"turn/steer": () => ({ error: { code: -32600, message: "no active turn" } }), // steer fails, no recoverable id
+			"turn/steer": () => ({ error: { code: -32600, message: "no active turn to steer" } }), // steer fails, no recoverable id
 		});
 		await client.inject("T", "first"); // opens turn_1
 		await expect(client.inject("T", "second")).rejects.toThrow(/turn\/start failed/);

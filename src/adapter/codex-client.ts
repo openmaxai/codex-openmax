@@ -76,6 +76,11 @@ export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "canc
 export type ReviewDecision = "approved" | "approved_for_session" | "denied" | "timed_out" | "abort";
 export type ElicitationAction = "accept" | "decline" | "cancel";
 
+/** One user-input question's answer, per ToolRequestUserInputAnswer schema. */
+export interface UserInputAnswer {
+	answers: string[];
+}
+
 /**
  * Exhaustive map of every server→client request method (codex 0.136.0 / 0.144.3 schema) to
  * its response-result type. `never` = no safe non-interactive result exists → must fail closed.
@@ -85,8 +90,8 @@ export interface ServerRequestResultMap {
 	"item/fileChange/requestApproval": { decision: ApprovalDecision };
 	execCommandApproval: { decision: ReviewDecision };
 	applyPatchApproval: { decision: ReviewDecision };
-	"item/tool/requestUserInput": { answers: Record<string, unknown> };
-	"mcpServer/elicitation/request": { action: ElicitationAction };
+	"item/tool/requestUserInput": { answers: Record<string, UserInputAnswer> };
+	"mcpServer/elicitation/request": { action: ElicitationAction; content?: unknown; _meta?: unknown };
 	"item/permissions/requestApproval": never;
 	"item/tool/call": never;
 	"account/chatgptAuthTokens/refresh": never;
@@ -94,15 +99,45 @@ export interface ServerRequestResultMap {
 }
 export type ServerRequestMethod = keyof ServerRequestResultMap;
 
-export interface ServerRequest<M extends string = string> {
-	id: number | string;
-	method: M;
-	params: unknown;
+/**
+ * Per-method request params (subset of fields we surface; faithful to the pinned schema's
+ * required fields so a handler can't read a cross-method field like `command` off a user-input
+ * request). `unknown` for methods with no safe non-interactive handler.
+ */
+export interface ServerRequestParamsMap {
+	"item/commandExecution/requestApproval": {
+		turnId: string;
+		threadId: string;
+		itemId: string;
+		startedAtMs: number;
+		command?: string | null;
+		approvalId?: string | null;
+	};
+	"item/fileChange/requestApproval": {
+		itemId: string;
+		threadId: string;
+		turnId: string;
+		startedAtMs: number;
+		reason?: string | null;
+	};
+	execCommandApproval: { callId: string; command: string[]; conversationId: string; cwd: string; parsedCmd: unknown[] };
+	applyPatchApproval: { callId: string; conversationId: string; fileChanges: Record<string, unknown> };
+	"item/tool/requestUserInput": { itemId: string; questions: unknown[]; threadId: string; turnId: string };
+	"mcpServer/elicitation/request": { serverName: string; threadId: string; turnId?: string | null };
+	"item/permissions/requestApproval": unknown;
+	"item/tool/call": unknown;
+	"account/chatgptAuthTokens/refresh": unknown;
+	"attestation/generate": unknown;
 }
 
+/** Discriminated server→client request: `params` is typed per `method`. */
+export type ServerRequest<M extends ServerRequestMethod = ServerRequestMethod> = {
+	[K in ServerRequestMethod]: { id: number | string; method: K; params: ServerRequestParamsMap[K] };
+}[M];
+
 /**
- * Per-method handler map: a handler for method M can ONLY return M's exact result type, so a
- * cross-method result (e.g. a `{decision}` from a user-input handler) fails to compile. Methods
+ * Per-method handler map: a handler for method M receives M's typed request and can ONLY return
+ * M's exact result type — a cross-method params read or result return fails to compile. Methods
  * whose result is `never` cannot be answered non-interactively (fail closed by omission).
  */
 export type ServerRequestHandlers = {
@@ -113,21 +148,34 @@ const APPROVAL_DECISIONS: ReadonlySet<string> = new Set(["accept", "acceptForSes
 const REVIEW_DECISIONS: ReadonlySet<string> = new Set(["approved", "approved_for_session", "denied", "timed_out", "abort"]);
 const ELICITATION_ACTIONS: ReadonlySet<string> = new Set(["accept", "decline", "cancel"]);
 
-/** Runtime guard: does `result` match `method`'s schema? Defends against non-TS/any-cast callers. */
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+/** True iff `obj`'s keys are all within `allowed` (rejects extra / cross-method fields). */
+const onlyKeys = (obj: Record<string, unknown>, allowed: readonly string[]) => Object.keys(obj).every((k) => allowed.includes(k));
+
+/**
+ * Runtime guard: does `result` EXACTLY match `method`'s schema (correct value types, valid
+ * enums, no extra/cross-method keys, full nested shape)? Defends against any-cast / JS callers
+ * that bypass the compile-time per-method typing. Anything not matching → fail closed.
+ */
 export function isValidServerResult(method: string, result: unknown): boolean {
-	if (result === null || typeof result !== "object") return false;
-	const r = result as Record<string, unknown>;
+	if (!isObj(result)) return false;
+	const r = result;
 	switch (method) {
 		case "item/commandExecution/requestApproval":
 		case "item/fileChange/requestApproval":
-			return typeof r.decision === "string" && APPROVAL_DECISIONS.has(r.decision);
+			return onlyKeys(r, ["decision"]) && typeof r.decision === "string" && APPROVAL_DECISIONS.has(r.decision);
 		case "execCommandApproval":
 		case "applyPatchApproval":
-			return typeof r.decision === "string" && REVIEW_DECISIONS.has(r.decision);
-		case "item/tool/requestUserInput":
-			return typeof r.answers === "object" && r.answers !== null;
+			return onlyKeys(r, ["decision"]) && typeof r.decision === "string" && REVIEW_DECISIONS.has(r.decision);
+		case "item/tool/requestUserInput": {
+			if (!onlyKeys(r, ["answers"]) || !isObj(r.answers)) return false;
+			// each answer must be exactly { answers: string[] }
+			return Object.values(r.answers).every(
+				(a) => isObj(a) && onlyKeys(a, ["answers"]) && Array.isArray(a.answers) && a.answers.every((s) => typeof s === "string"),
+			);
+		}
 		case "mcpServer/elicitation/request":
-			return typeof r.action === "string" && ELICITATION_ACTIONS.has(r.action);
+			return onlyKeys(r, ["action", "content", "_meta"]) && typeof r.action === "string" && ELICITATION_ACTIONS.has(r.action);
 		default:
 			return false; // never-methods have no valid result
 	}
@@ -165,9 +213,13 @@ export function defaultServerRequestResponse(method: string): { result: object }
  * turn (that would double-inject the same wake).
  */
 export function classifySteerError(err: { code?: number; message: string }): "cas-retry" | "no-active-turn" | "terminal" {
+	// Only the app-server's exact -32600 CAS/no-turn errors are safe to act on. Any other code
+	// (internal -32000, RPC timeout -2, disconnect -1, unknown) or an unanchored message that
+	// merely *contains* "no active turn" is TERMINAL — never a second-turn fallback (double-inject).
+	if (err.code !== -32600) return "terminal";
 	const m = err.message || "";
-	if (/but found `[^`]+`/.test(m)) return "cas-retry";
-	if (/no active turn/i.test(m)) return "no-active-turn";
+	if (/^expected active turn id `[^`]+` but found `[^`]+`$/.test(m)) return "cas-retry";
+	if (m === "no active turn to steer") return "no-active-turn";
 	return "terminal";
 }
 
@@ -300,7 +352,7 @@ export function createCodexClient(transport: Transport, opts?: { requestTimeoutM
 				respond(msg.id, defaultServerRequestResponse(method));
 				return;
 			}
-			handler({ id: msg.id, method, params: msg.params })
+			handler({ id: msg.id, method, params: msg.params } as ServerRequest)
 				.then((result) => {
 					// Runtime guard: never forward a shape Codex can't decode, even if a JS/any-cast
 					// caller bypassed the compile-time per-method typing.
