@@ -6,6 +6,7 @@
 //      report success without confirmed entry into model-visible history).
 // Thread registry (conversationId -> threadId) lives in server.ts (P1); callers pass threadId.
 import type { CodexClient } from "./codex-client.js";
+import { classifyFailure, isAuthTerminal, retryAfterMs } from "./invariants.js";
 import type { WakeRequest, WakeResponse } from "../types.js";
 
 export function formatWakeText(wake: WakeRequest): string {
@@ -23,11 +24,14 @@ export async function injectWake(
 	try {
 		const outcome = await client.inject(threadId, formatWakeText(wake), opts);
 		if (!outcome.delivered) {
-			// RPC accepted but no item/completed confirmation: do NOT claim success.
-			return { ok: false, failureClass: "inject_failed", retryAfterMs: 5_000 };
+			// RPC accepted but no item/completed confirmation: do NOT claim success. Retryable.
+			return { ok: false, failureClass: "inject_failed", retryAfterMs: retryAfterMs("inject_failed") };
 		}
 		return { ok: true, runtimeSession: threadId };
-	} catch {
-		return { ok: false, failureClass: "runtime_error", retryAfterMs: 15_000 };
+	} catch (err) {
+		// Auth failures are terminal — no retryAfterMs, so upstream won't loop on a bad key.
+		if (isAuthTerminal(err)) return { ok: false, failureClass: "runtime_error" };
+		const failureClass = classifyFailure(err);
+		return { ok: false, failureClass, retryAfterMs: retryAfterMs(failureClass) };
 	}
 }

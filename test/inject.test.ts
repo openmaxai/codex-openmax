@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { classifyFailure } from "../src/adapter/invariants.js";
+import { classifyFailure, isAuthTerminal, isRetryable, retryAfterMs } from "../src/adapter/invariants.js";
 import {
 	activeTurnIdFromSteerError,
 	classifySteerError,
@@ -985,7 +985,25 @@ describe("protocol parsing", () => {
 		expect(activeTurnIdFromSteerError("some other error")).toBeNull();
 	});
 
-	it("classifyFailure defaults to unknown (P2 will enumerate)", () => {
-		expect(classifyFailure(new Error("x"))).toBe("unknown");
+	it("classifyFailure maps concrete causes; defaults to runtime_error (never silently ok)", () => {
+		expect(classifyFailure(new Error("transport disconnected: app-server exited"))).toBe("runtime_error");
+		expect(classifyFailure(new Error("request turn/steer timed out"))).toBe("inject_failed");
+		expect(classifyFailure(new Error("no active turn to steer"))).toBe("no_active_turn");
+		expect(classifyFailure(new Error("thread already has an active turn"))).toBe("runtime_busy");
+		expect(classifyFailure({ httpStatusCode: 401, message: "Unauthorized" })).toBe("runtime_error");
+		expect(classifyFailure(new Error("something weird"))).toBe("runtime_error"); // default, retryable
+	});
+
+	it("isAuthTerminal flags 401 / unauthorized (terminal, no retry)", () => {
+		expect(isAuthTerminal({ httpStatusCode: 401, message: "x" })).toBe(true);
+		expect(isAuthTerminal(new Error("Missing bearer or basic authentication"))).toBe(true);
+		expect(isAuthTerminal(new Error("no active turn to steer"))).toBe(false);
+	});
+
+	it("isRetryable/retryAfterMs: retryable classes carry a backoff", () => {
+		for (const fc of ["no_active_turn", "runtime_busy", "inject_failed", "runtime_error", "unknown"] as const) {
+			expect(isRetryable(fc)).toBe(true);
+			expect(typeof retryAfterMs(fc)).toBe("number");
+		}
 	});
 });
