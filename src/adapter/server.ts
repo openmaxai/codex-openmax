@@ -4,7 +4,7 @@
 // /send: receive a runtime reply -> hand to the Bridge (handleSend) -> return SendResponse.
 // Contract: see types.ts / Architecture Part 1.5. Uses only node:http (no external deps).
 import { createServer, type IncomingMessage, type Server } from "node:http";
-import type { SendRequest, SendResponse, WakeRequest, WakeResponse } from "../types.js";
+import { WAKE_SCHEMA, type SendRequest, type SendResponse, type WakeRequest, type WakeResponse } from "../types.js";
 
 export interface AdapterServerDeps {
 	handleWake: (wake: WakeRequest) => Promise<WakeResponse>;
@@ -41,10 +41,17 @@ function readJsonBody(req: IncomingMessage, limitBytes = 1_000_000): Promise<unk
 	});
 }
 
-/** Minimal shape guards so a malformed POST body fails fast with 400, not deep in the handler. */
-function isWakeRequest(v: unknown): v is WakeRequest {
+const WAKE_FIELDS = ["schema", "messageId", "conversationId", "senderId", "contentPreview"] as const;
+
+/** Schema-exact guard per wake-request.schema.json: five REQUIRED string fields,
+ * schema = const WAKE_SCHEMA, additionalProperties:false (drift alarm).
+ * Exported so the contract-conformance test can run the SDK golden fixtures through it. */
+export function isWakeRequest(v: unknown): v is WakeRequest {
+	if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
 	const o = v as Record<string, unknown>;
-	return !!o && typeof o.messageId === "string" && typeof o.conversationId === "string" && typeof o.senderId === "string";
+	if (!Object.keys(o).every((k) => (WAKE_FIELDS as readonly string[]).includes(k))) return false;
+	if (o.schema !== WAKE_SCHEMA) return false;
+	return WAKE_FIELDS.every((f) => typeof o[f] === "string");
 }
 function isSendRequest(v: unknown): v is SendRequest {
 	const o = v as Record<string, unknown>;

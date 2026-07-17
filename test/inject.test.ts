@@ -78,7 +78,7 @@ function confirmingTurnStart(threadId = "thr_1", turnId = "turn_1"): Handler {
 }
 
 const WAKE: WakeRequest = {
-	schema: "channel-wake.v1",
+	schema: "raft-channel-wake.v1",
 	messageId: "m1",
 	conversationId: "c1",
 	senderId: "u1",

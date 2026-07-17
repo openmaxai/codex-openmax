@@ -4,7 +4,7 @@ import { createMockCwsBridge } from "../src/bridge/cws-bridge.js";
 import type { SendRequest, WakeRequest, WakeResponse } from "../src/types.js";
 
 const WAKE: WakeRequest = {
-	schema: "channel-wake.v1",
+	schema: "raft-channel-wake.v1",
 	messageId: "m1",
 	conversationId: "conv_A",
 	senderId: "u1",

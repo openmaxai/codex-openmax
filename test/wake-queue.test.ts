@@ -3,7 +3,7 @@ import { createWakeQueue } from "../src/adapter/wake-queue.js";
 import type { WakeRequest, WakeResponse } from "../src/types.js";
 
 function wake(messageId: string, conversationId = "conv_A"): WakeRequest {
-	return { schema: "channel-wake.v1", messageId, conversationId, senderId: "u1", contentPreview: "hi" };
+	return { schema: "raft-channel-wake.v1", messageId, conversationId, senderId: "u1", contentPreview: "hi" };
 }
 
 /** A processor whose completion the test controls, recording call order. */

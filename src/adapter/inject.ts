@@ -10,9 +10,9 @@ import { classifyFailure, isAuthTerminal, retryAfterMs } from "./invariants.js";
 import type { WakeRequest, WakeResponse } from "../types.js";
 
 export function formatWakeText(wake: WakeRequest): string {
-	// MVP: relay the preview; P1 decides preview-vs-full-content fetch via the Bridge.
-	const preview = wake.contentPreview ?? "(no preview)";
-	return `[CWS message ${wake.messageId} in conversation ${wake.conversationId} from ${wake.senderId}]\n${preview}`;
+	// MVP: relay the preview (REQUIRED per wake-request.schema.json); P1 decides
+	// preview-vs-full-content fetch via the Bridge.
+	return `[CWS message ${wake.messageId} in conversation ${wake.conversationId} from ${wake.senderId}]\n${wake.contentPreview}`;
 }
 
 export async function injectWake(

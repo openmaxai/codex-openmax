@@ -1,0 +1,11 @@
+{
+  "description": "A wrong/absent schema discriminator is rejected (drift guard for the contract tag).",
+  "input": {
+    "schema": "raft-channel-wake.v2",
+    "messageId": "m1",
+    "conversationId": "c1",
+    "senderId": "u1",
+    "contentPreview": "hello"
+  },
+  "expectValid": false
+}

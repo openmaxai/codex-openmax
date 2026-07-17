@@ -2,13 +2,18 @@
 // Matches "Architecture + Plan" Part 1.5 / 2.3. Prefer reusing these from
 // @openmaxai/cws-agent-sdk when it lands; do not redefine.
 
-/** POST /wake -- CWS notifies Layer2 of a new message. */
+/** Contract discriminator pinned by wake-request.schema.json (const). */
+export const WAKE_SCHEMA = "raft-channel-wake.v1";
+
+/** POST /wake -- CWS notifies Layer2 of a new message.
+ * Canonical shape: schemas/v1/wake-request.schema.json in @openmaxai/openmax-agent-sdk —
+ * all five fields REQUIRED, additionalProperties:false, schema = const WAKE_SCHEMA. */
 export interface WakeRequest {
-	schema: string;
+	schema: typeof WAKE_SCHEMA;
 	messageId: string;
 	conversationId: string;
 	senderId: string;
-	contentPreview?: string;
+	contentPreview: string;
 }
 export type WakeResponse =
 	| { ok: true; runtimeSession?: string }

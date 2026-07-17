@@ -1,0 +1,11 @@
+{
+  "description": "A well-formed raft-channel-wake.v1 request validates.",
+  "input": {
+    "schema": "raft-channel-wake.v1",
+    "messageId": "m1",
+    "conversationId": "c1",
+    "senderId": "u1",
+    "contentPreview": "hello there"
+  },
+  "expectValid": true
+}
