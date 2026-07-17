@@ -72,9 +72,29 @@ export interface CodexErrorEvent {
 // cross-method result is a compile error and is also rejected at runtime. With no handler
 // for a method we apply a NON-INTERACTIVE policy: schema-shaped DENY where a decline exists,
 // else fail closed. It NEVER approves anything.
-export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
-export type ReviewDecision = "approved" | "approved_for_session" | "denied" | "timed_out" | "abort";
+// Decision types mirror the pinned Codex stable schema (0.136.0 / 0.144.3), including the
+// STRUCTURED amendment variants — a string-only union would wrongly reject legit results.
+type ExecPolicyAmendment = Record<string, JsonValue>;
+type NetworkPolicyAmendment = Record<string, JsonValue>;
+export type ApprovalDecision =
+	| "accept"
+	| "acceptForSession"
+	| { acceptWithExecpolicyAmendment: { execpolicy_amendment: ExecPolicyAmendment } }
+	| { applyNetworkPolicyAmendment: { network_policy_amendment: NetworkPolicyAmendment } }
+	| "decline"
+	| "cancel";
+export type ReviewDecision =
+	| "approved"
+	| { approved_execpolicy_amendment: { proposed_execpolicy_amendment: ExecPolicyAmendment } }
+	| "approved_for_session"
+	| { network_policy_amendment: { network_policy_amendment: NetworkPolicyAmendment } }
+	| "denied"
+	| "timed_out"
+	| "abort";
 export type ElicitationAction = "accept" | "decline" | "cancel";
+
+/** JSON value — the only shapes that can round-trip on the wire (no function/symbol/undefined). */
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [k: string]: JsonValue };
 
 /** One user-input question's answer, per ToolRequestUserInputAnswer schema. */
 export interface UserInputAnswer {
@@ -144,29 +164,57 @@ export type ServerRequestHandlers = {
 	[M in ServerRequestMethod]?: (req: ServerRequest<M>) => Promise<ServerRequestResultMap[M]>;
 };
 
-const APPROVAL_DECISIONS: ReadonlySet<string> = new Set(["accept", "acceptForSession", "decline", "cancel"]);
-const REVIEW_DECISIONS: ReadonlySet<string> = new Set(["approved", "approved_for_session", "denied", "timed_out", "abort"]);
+const APPROVAL_STRINGS: ReadonlySet<string> = new Set(["accept", "acceptForSession", "decline", "cancel"]);
+const APPROVAL_AMENDMENT_KEYS: ReadonlySet<string> = new Set(["acceptWithExecpolicyAmendment", "applyNetworkPolicyAmendment"]);
+const REVIEW_STRINGS: ReadonlySet<string> = new Set(["approved", "approved_for_session", "denied", "timed_out", "abort"]);
+const REVIEW_AMENDMENT_KEYS: ReadonlySet<string> = new Set(["approved_execpolicy_amendment", "network_policy_amendment"]);
 const ELICITATION_ACTIONS: ReadonlySet<string> = new Set(["accept", "decline", "cancel"]);
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 /** True iff `obj`'s keys are all within `allowed` (rejects extra / cross-method fields). */
 const onlyKeys = (obj: Record<string, unknown>, allowed: readonly string[]) => Object.keys(obj).every((k) => allowed.includes(k));
 
+/** True iff `v` is a pure JSON value (rejects function/symbol/undefined/bigint anywhere nested). */
+export function isJsonValue(v: unknown): boolean {
+	if (v === null) return true;
+	switch (typeof v) {
+		case "boolean":
+		case "string":
+			return true;
+		case "number":
+			return Number.isFinite(v);
+		case "object":
+			if (Array.isArray(v)) return v.every(isJsonValue);
+			return Object.values(v as Record<string, unknown>).every(isJsonValue);
+		default:
+			return false; // function / symbol / undefined / bigint
+	}
+}
+
+/** A decision is either an allowed enum string, or exactly one allowed structured amendment object (JSON-valued). */
+function isValidDecision(d: unknown, strings: ReadonlySet<string>, amendmentKeys: ReadonlySet<string>): boolean {
+	if (typeof d === "string") return strings.has(d);
+	if (!isObj(d)) return false;
+	const keys = Object.keys(d);
+	return keys.length === 1 && amendmentKeys.has(keys[0]) && isJsonValue(d[keys[0]]);
+}
+
 /**
- * Runtime guard: does `result` EXACTLY match `method`'s schema (correct value types, valid
- * enums, no extra/cross-method keys, full nested shape)? Defends against any-cast / JS callers
- * that bypass the compile-time per-method typing. Anything not matching → fail closed.
+ * Runtime guard: does `result` EXACTLY match `method`'s schema (valid enum OR structured
+ * amendment variant, no extra/cross-method keys, full nested shape, and every nested value a
+ * pure JSON value)? Defends against any-cast / JS callers that bypass the compile-time typing.
+ * Anything not matching → fail closed.
  */
 export function isValidServerResult(method: string, result: unknown): boolean {
-	if (!isObj(result)) return false;
+	if (!isObj(result) || !isJsonValue(result)) return false;
 	const r = result;
 	switch (method) {
 		case "item/commandExecution/requestApproval":
 		case "item/fileChange/requestApproval":
-			return onlyKeys(r, ["decision"]) && typeof r.decision === "string" && APPROVAL_DECISIONS.has(r.decision);
+			return onlyKeys(r, ["decision"]) && isValidDecision(r.decision, APPROVAL_STRINGS, APPROVAL_AMENDMENT_KEYS);
 		case "execCommandApproval":
 		case "applyPatchApproval":
-			return onlyKeys(r, ["decision"]) && typeof r.decision === "string" && REVIEW_DECISIONS.has(r.decision);
+			return onlyKeys(r, ["decision"]) && isValidDecision(r.decision, REVIEW_STRINGS, REVIEW_AMENDMENT_KEYS);
 		case "item/tool/requestUserInput": {
 			if (!onlyKeys(r, ["answers"]) || !isObj(r.answers)) return false;
 			// each answer must be exactly { answers: string[] }

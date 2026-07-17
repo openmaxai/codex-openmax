@@ -342,6 +342,19 @@ describe("codex-client server request handling (P1#3)", () => {
 		// exec/patch review
 		expect(isValidServerResult("execCommandApproval", { decision: "denied" })).toBe(true);
 		expect(isValidServerResult("execCommandApproval", { decision: "decline" })).toBe(false); // approval enum, not review
+		// STRUCTURED decision variants are legit and must be accepted (were wrongly rejected before)
+		expect(
+			isValidServerResult("execCommandApproval", { decision: { approved_execpolicy_amendment: { proposed_execpolicy_amendment: {} } } }),
+		).toBe(true);
+		expect(
+			isValidServerResult("item/commandExecution/requestApproval", {
+				decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { host: "x" } } },
+			}),
+		).toBe(true);
+		expect(isValidServerResult("execCommandApproval", { decision: { bogus_amendment: {} } })).toBe(false); // unknown variant
+		// non-JSON nested value must be rejected (can't round-trip on the wire)
+		expect(isValidServerResult("execCommandApproval", { decision: { approved_execpolicy_amendment: { fn: () => 1 } } })).toBe(false);
+		expect(isValidServerResult("mcpServer/elicitation/request", { action: "decline", content: { bad: undefined } })).toBe(false);
 		// user-input: nested { answers: { [q]: { answers: string[] } } }
 		expect(isValidServerResult("item/tool/requestUserInput", { answers: {} })).toBe(true);
 		expect(isValidServerResult("item/tool/requestUserInput", { answers: { q: { answers: ["a"] } } })).toBe(true);
