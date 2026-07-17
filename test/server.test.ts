@@ -105,7 +105,9 @@ describe("adapter HTTP server (P1 MVP)", () => {
 				// Inbound: bridge delivers a CWS message → /wake.
 				bridge.onInbound(async (w) => {
 					const res = await fetch(`${base}/wake`, { method: "POST", body: JSON.stringify(w) });
-					expect((await res.json()).ok).toBe(true);
+					const body = (await res.json()) as WakeResponse;
+					expect(body.ok).toBe(true);
+					return body; // deliver() fidelity: the wake result flows back to the bridge
 				});
 				await bridge.simulateInbound(WAKE);
 				expect(injected).toEqual([WAKE]);

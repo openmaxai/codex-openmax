@@ -9,7 +9,7 @@ import { startAdapterServer } from "./adapter/server.js";
 import { createMockCwsBridge, type CwsBridge } from "./bridge/cws-bridge.js";
 import { createWakeQueue } from "./adapter/wake-queue.js";
 import { loadConfig } from "./config.js";
-import type { SendRequest, WakeRequest } from "./types.js";
+import type { SendRequest, WakeRequest, WakeResponse } from "./types.js";
 
 export interface RuntimeHandle {
 	port: number;
@@ -56,13 +56,22 @@ export async function main(bridge: CwsBridge = createMockCwsBridge()): Promise<R
 		config.bridge.localHttpPort,
 	);
 
-	// Inbound: the bridge hands each CWS message to the local /wake endpoint.
+	// Inbound: the bridge hands each CWS message to the local /wake endpoint. The /wake
+	// response is returned to the bridge VERBATIM — the SDK's deliver() resolves with it, and
+	// ok:true is what commits its dedupe/ledger/sync markers (wake-result invariant). A
+	// transport failure here is a typed retryable failure, never a fabricated ok.
 	bridge.onInbound(async (wake) => {
-		await fetch(`http://127.0.0.1:${server.port}/wake`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(wake),
-		}).catch((e) => log(`inbound /wake failed: ${String(e)}`));
+		try {
+			const res = await fetch(`http://127.0.0.1:${server.port}/wake`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(wake),
+			});
+			return (await res.json()) as WakeResponse;
+		} catch (e) {
+			log(`inbound /wake failed: ${String(e)}`);
+			return { ok: false, failureClass: "runtime_error", retryAfterMs: 15_000 };
+		}
 	});
 
 	// Outbound: a completed Codex agentMessage → POST /send (which hands to the bridge).
