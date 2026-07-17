@@ -7,6 +7,7 @@ import { createCodexClient, spawnAppServerTransport } from "./adapter/codex-clie
 import { injectWake } from "./adapter/inject.js";
 import { startAdapterServer } from "./adapter/server.js";
 import { createMockCwsBridge, type CwsBridge } from "./bridge/cws-bridge.js";
+import { createWakeQueue } from "./adapter/wake-queue.js";
 import { loadConfig } from "./config.js";
 import type { SendRequest, WakeRequest } from "./types.js";
 
@@ -38,12 +39,17 @@ export async function main(bridge: CwsBridge = createMockCwsBridge()): Promise<R
 		return threadId;
 	}
 
+	// Per-conversation FIFO + messageId dedup + depth-capped backpressure (wake-queue.ts).
+	// Serialization also closes the ensureThread race: one conversation never runs two
+	// wakes concurrently, so a first-wake pair can't both spawn a thread.
+	const wakeQueue = createWakeQueue(async (wake: WakeRequest) => {
+		const threadId = await ensureThread(wake.conversationId);
+		return injectWake(client, threadId, wake);
+	});
+
 	const server = await startAdapterServer(
 		{
-			handleWake: async (wake: WakeRequest) => {
-				const threadId = await ensureThread(wake.conversationId);
-				return injectWake(client, threadId, wake);
-			},
+			handleWake: (wake: WakeRequest) => wakeQueue.enqueue(wake),
 			handleSend: (req: SendRequest) => bridge.send(req).then((r) => (r.ok && r.messageId ? { ok: true as const, messageId: r.messageId } : { ok: false as const, failureClass: "runtime_error" as const })),
 			log,
 		},
