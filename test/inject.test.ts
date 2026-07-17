@@ -508,6 +508,96 @@ describe("codex-client server request handling (P1#3)", () => {
 });
 
 // P1#4 regression: transport death must settle everything, not hang.
+// Runtime-verify P1 (jinglever, live-reproduced 3/3 on codex-cli 0.137.0): two concurrent
+// injects on an idle thread both observed "no active turn" and both issued turn/start; the
+// real app-server coalesced both messages into the FIRST turn, so the second caller's
+// returned turnId was false. inject() is now serialized per thread.
+describe("codex-client concurrent first-wake serialization (runtime-verify P1)", () => {
+	const confirmingSteer: Handler = (req, emit) => {
+		emit({
+			method: "item/completed",
+			params: {
+				threadId: req.params.threadId,
+				turnId: req.params.expectedTurnId,
+				item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
+			},
+		});
+		return { result: {} };
+	};
+
+	it("KILLING: two concurrent injects on an idle thread → exactly ONE turn/start; the second STEERS the first turn and reports truthful ownership", async () => {
+		const { client, sent } = await startedClient({ "turn/start": confirmingTurnStart(), "turn/steer": confirmingSteer });
+		const threadId = await client.startThread();
+		const [first, second] = await Promise.all([client.inject(threadId, "FIRST"), client.inject(threadId, "SECOND")]);
+		expect(sent.filter((r) => r.method === "turn/start")).toHaveLength(1); // never two starts
+		expect(sent.filter((r) => r.method === "turn/steer")).toHaveLength(1);
+		expect(first).toEqual({ turnId: "turn_1", delivered: true, mode: "turn/start" });
+		expect(second).toEqual({ turnId: "turn_1", delivered: true, mode: "turn/steer" }); // truthful owner, not a phantom turn
+	});
+
+	it("KILLING: a FAILING first inject does not wedge the thread's chain — the next inject still runs", async () => {
+		let firstCall = true;
+		const { client, sent } = await startedClient({
+			"turn/start": (req, emit) => {
+				if (firstCall) {
+					firstCall = false;
+					return { error: { code: -32000, message: "internal error" } };
+				}
+				return confirmingTurnStart()(req, emit);
+			},
+		});
+		const threadId = await client.startThread();
+		const results = await Promise.allSettled([client.inject(threadId, "boom"), client.inject(threadId, "after")]);
+		expect(results[0].status).toBe("rejected");
+		expect(results[1].status).toBe("fulfilled");
+		expect((results[1] as PromiseFulfilledResult<{ delivered: boolean }>).value.delivered).toBe(true);
+		expect(sent.filter((r) => r.method === "turn/start")).toHaveLength(2);
+	});
+
+	it("different threads are NOT serialized against each other (no cross-thread head-of-line blocking)", async () => {
+		const starts: string[] = [];
+		const { client } = await startedClient({
+			"turn/start": (req, emit) => {
+				starts.push(req.params.threadId);
+				return confirmingTurnStart(req.params.threadId, `turn_${req.params.threadId}`)(req, emit);
+			},
+		});
+		await Promise.all([client.inject("A", "a"), client.inject("B", "b")]);
+		expect(starts.sort()).toEqual(["A", "B"]); // both started; neither waited on the other's chain
+	});
+});
+
+// Runtime-verify P1 (jinglever): stderr was spawned with "ignore" — real app-server startup/auth/
+// MCP diagnostics were silently discarded. It is now piped, continuously drained, and a bounded
+// tail is attached to the exit reason.
+describe("spawnAppServerTransport stderr retention (runtime-verify P1)", () => {
+	it("KILLING: child stderr is drained (onStderrLine) and a bounded tail lands in the exit reason", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		const script = `process.stderr.write("ERROR model-cache parse failure\\nERROR MCP startup failed\\n"); process.exit(7);`;
+		const drained: string[] = [];
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script], onStderrLine: (l) => drained.push(l) });
+		const reason = await new Promise<string>((resolve) => transport.onExit(resolve));
+		expect(reason).toContain("code=7");
+		expect(reason).toContain("stderr tail");
+		expect(reason).toContain("ERROR model-cache parse failure");
+		expect(reason).toContain("ERROR MCP startup failed");
+		expect(drained).toEqual(["ERROR model-cache parse failure", "ERROR MCP startup failed"]);
+	});
+
+	it("stderr tail is BOUNDED (last 50 lines, 500 chars each) — a chatty server cannot balloon the exit reason", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		const script = `for (let i = 0; i < 120; i++) process.stderr.write("line-" + i + "-" + "x".repeat(600) + "\\n"); process.exit(1);`;
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script] });
+		const reason = await new Promise<string>((resolve) => transport.onExit(resolve));
+		expect(reason).not.toContain("line-69-"); // older than the 50-line window (70..119 kept)
+		expect(reason).toContain("line-70-");
+		expect(reason).toContain("line-119-");
+		const lines = reason.split("\n").filter((l) => l.startsWith("line-"));
+		expect(lines).toHaveLength(50);
+		for (const l of lines) expect(l.length).toBeLessThanOrEqual(500);
+	});
+});
+
 describe("codex-client transport failure convergence (P1#4)", () => {
 	it("KILLING: app-server exit rejects in-flight inject instead of hanging forever", async () => {
 		const { client, kill } = await startedClient({

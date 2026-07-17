@@ -17,15 +17,31 @@ export interface Transport {
 	close(): void;
 }
 
-export function spawnAppServerTransport(codexBin = "codex"): Transport {
-	const child = spawn(codexBin, ["app-server"], { stdio: ["pipe", "pipe", "ignore"] });
+/** Bounded stderr retention (runtime-verify P1: stderr must never be silently discarded). */
+const STDERR_TAIL_MAX_LINES = 50;
+const STDERR_LINE_MAX_CHARS = 500;
+
+export interface SpawnTransportOpts {
+	/** Override argv (tests point codexBin at `node` + a fixture script). Default: ["app-server"]. */
+	args?: string[];
+	/** Continuous drain hook — called once per stderr line (bounded length), e.g. a logger. */
+	onStderrLine?: (line: string) => void;
+}
+
+export function spawnAppServerTransport(codexBin = "codex", opts?: SpawnTransportOpts): Transport {
+	// stderr is PIPED and continuously drained (never "ignore"): the real app-server emits
+	// startup/auth/MCP diagnostics there, and a bounded tail is attached to the exit reason so
+	// a failed deployment keeps the evidence needed to diagnose it.
+	const child = spawn(codexBin, opts?.args ?? ["app-server"], { stdio: ["pipe", "pipe", "pipe"] });
 	const lineCbs: Array<(line: string) => void> = [];
 	const exitCbs: Array<(reason: string) => void> = [];
+	const stderrTail: string[] = [];
 	let ended = false;
+	const withTail = (reason: string) => (stderrTail.length ? `${reason}; stderr tail:\n${stderrTail.join("\n")}` : reason);
 	const fireExit = (reason: string) => {
 		if (ended) return;
 		ended = true;
-		for (const cb of exitCbs) cb(reason);
+		for (const cb of exitCbs) cb(withTail(reason));
 	};
 	let buf = "";
 	child.stdout.on("data", (d) => {
@@ -35,6 +51,19 @@ export function spawnAppServerTransport(codexBin = "codex"): Transport {
 			const line = buf.slice(0, i);
 			buf = buf.slice(i + 1);
 			if (line.trim()) for (const cb of lineCbs) cb(line);
+		}
+	});
+	let errBuf = "";
+	child.stderr?.on("data", (d) => {
+		errBuf += d.toString();
+		let i: number;
+		while ((i = errBuf.indexOf("\n")) >= 0) {
+			const line = errBuf.slice(0, i).slice(0, STDERR_LINE_MAX_CHARS);
+			errBuf = errBuf.slice(i + 1);
+			if (!line.trim()) continue;
+			stderrTail.push(line);
+			if (stderrTail.length > STDERR_TAIL_MAX_LINES) stderrTail.shift();
+			opts?.onStderrLine?.(line);
 		}
 	});
 	child.on("error", (err) => fireExit(`spawn error: ${String(err)}`));
@@ -542,6 +571,72 @@ export function createCodexClient(transport: Transport, opts?: { requestTimeoutM
 		return { promise, cancel };
 	}
 
+	// Per-thread inject serialization chain — runtime-verify P1 fix (live-reproduced 3/3 by
+	// jinglever on codex-cli 0.137.0): two concurrent injects on an idle thread could both read
+	// "no active turn" and both turn/start; the app-server coalesces both messages into the
+	// FIRST turn, so the second caller's returned turnId is false. Serializing per thread means
+	// the second wake runs after the first settles, observes its turn, and steers it truthfully.
+	const injectChains = new Map<string, Promise<unknown>>();
+
+	async function doInject(threadId: string, text: string, opts?: { deliveryTimeoutMs?: number }): Promise<InjectOutcome> {
+		if (!connected) throw new Error("cannot inject: transport disconnected");
+		const clientUserMessageId = randomUUID();
+		const input = [{ type: "text", text }];
+		const timeoutMs = opts?.deliveryTimeoutMs ?? DEFAULT_DELIVERY_TIMEOUT_MS;
+		const waiter = createDeliveryWaiter(clientUserMessageId, timeoutMs);
+
+		try {
+			const startTurn = async (): Promise<InjectOutcome> => {
+				const resp = await request("turn/start", { threadId, input, clientUserMessageId });
+				if (resp.error) throw new Error(`turn/start failed: ${resp.error.message}`);
+				const turnId = resp.result?.turn?.id;
+				if (typeof turnId !== "string") throw new Error("turn/start returned an unexpected response shape (no turn id)");
+				activeTurns.set(threadId, turnId);
+				return { turnId, delivered: await waiter.promise, mode: "turn/start" };
+			};
+
+			const expected = activeTurns.get(threadId);
+			if (!expected) return await startTurn();
+
+			let resp = await request("turn/steer", { threadId, expectedTurnId: expected, input, clientUserMessageId });
+			if (resp.error) {
+				// P1#2 fix: classify the steer error — do NOT blindly fall back to turn/start,
+				// which would double-inject on a terminal/timeout error whose steer may still land.
+				const kind = classifySteerError(resp.error);
+				if (kind === "cas-retry") {
+					const realId = activeTurnIdFromSteerError(resp.error.message);
+					if (!realId) throw new Error(`turn/steer CAS error without a recoverable id: ${resp.error.message}`);
+					resp = await request("turn/steer", { threadId, expectedTurnId: realId, input, clientUserMessageId });
+					if (!resp.error) {
+						// P2#2 fix: write back the recovered id so the next wake steers it and
+						// turn/completed(realId) can clear it.
+						activeTurns.set(threadId, realId);
+						return { turnId: realId, delivered: await waiter.promise, mode: "turn/steer" };
+					}
+					// second steer failed: only fall back if it now confirms no active turn.
+					if (classifySteerError(resp.error) === "no-active-turn") {
+						activeTurns.delete(threadId);
+						return await startTurn();
+					}
+					throw new Error(`turn/steer retry failed: ${resp.error.message}`);
+				}
+				if (kind === "no-active-turn") {
+					// Confirmed no active turn: nothing was injected, safe to start fresh (reuse id ok).
+					activeTurns.delete(threadId);
+					return await startTurn();
+				}
+				// Terminal (internal error / RPC timeout): the steer may or may not have landed —
+				// never start a second turn (double-inject risk). Reject; the catch cancels the waiter.
+				throw new Error(`turn/steer failed (terminal, no fallback): ${resp.error.message}`);
+			}
+			return { turnId: expected, delivered: await waiter.promise, mode: "turn/steer" };
+		} catch (err) {
+			// P2#3 fix: terminal failure must not leave the delivery waiter/timer behind.
+			waiter.cancel();
+			throw err;
+		}
+	}
+
 	return {
 		async start() {
 			const resp = await request("initialize", { clientInfo: { name: "codex-openmax", version: "0.0.0" } });
@@ -554,65 +649,24 @@ export function createCodexClient(transport: Transport, opts?: { requestTimeoutM
 		async startThread(opts) {
 			const resp = await request("thread/start", { cwd: opts?.cwd, ephemeral: opts?.ephemeral ?? false });
 			if (resp.error) throw new Error(`thread/start failed: ${resp.error.message}`);
-			return resp.result.thread.id as string;
+			const id = resp.result?.thread?.id;
+			if (typeof id !== "string") throw new Error("thread/start returned an unexpected response shape (no thread id)");
+			return id;
 		},
 		activeTurnId: (threadId) => activeTurns.get(threadId) ?? null,
-		async inject(threadId, text, opts) {
-			if (!connected) throw new Error("cannot inject: transport disconnected");
-			const clientUserMessageId = randomUUID();
-			const input = [{ type: "text", text }];
-			const timeoutMs = opts?.deliveryTimeoutMs ?? DEFAULT_DELIVERY_TIMEOUT_MS;
-			const waiter = createDeliveryWaiter(clientUserMessageId, timeoutMs);
-
-			try {
-				const startTurn = async (): Promise<InjectOutcome> => {
-					const resp = await request("turn/start", { threadId, input, clientUserMessageId });
-					if (resp.error) throw new Error(`turn/start failed: ${resp.error.message}`);
-					const turnId = resp.result.turn.id;
-					activeTurns.set(threadId, turnId);
-					return { turnId, delivered: await waiter.promise, mode: "turn/start" };
-				};
-
-				const expected = activeTurns.get(threadId);
-				if (!expected) return await startTurn();
-
-				let resp = await request("turn/steer", { threadId, expectedTurnId: expected, input, clientUserMessageId });
-				if (resp.error) {
-					// P1#2 fix: classify the steer error — do NOT blindly fall back to turn/start,
-					// which would double-inject on a terminal/timeout error whose steer may still land.
-					const kind = classifySteerError(resp.error);
-					if (kind === "cas-retry") {
-						const realId = activeTurnIdFromSteerError(resp.error.message);
-						if (!realId) throw new Error(`turn/steer CAS error without a recoverable id: ${resp.error.message}`);
-						resp = await request("turn/steer", { threadId, expectedTurnId: realId, input, clientUserMessageId });
-						if (!resp.error) {
-							// P2#2 fix: write back the recovered id so the next wake steers it and
-							// turn/completed(realId) can clear it.
-							activeTurns.set(threadId, realId);
-							return { turnId: realId, delivered: await waiter.promise, mode: "turn/steer" };
-						}
-						// second steer failed: only fall back if it now confirms no active turn.
-						if (classifySteerError(resp.error) === "no-active-turn") {
-							activeTurns.delete(threadId);
-							return await startTurn();
-						}
-						throw new Error(`turn/steer retry failed: ${resp.error.message}`);
-					}
-					if (kind === "no-active-turn") {
-						// Confirmed no active turn: nothing was injected, safe to start fresh (reuse id ok).
-						activeTurns.delete(threadId);
-						return await startTurn();
-					}
-					// Terminal (internal error / RPC timeout): the steer may or may not have landed —
-					// never start a second turn (double-inject risk). Reject; the catch cancels the waiter.
-					throw new Error(`turn/steer failed (terminal, no fallback): ${resp.error.message}`);
-				}
-				return { turnId: expected, delivered: await waiter.promise, mode: "turn/steer" };
-			} catch (err) {
-				// P2#3 fix: terminal failure must not leave the delivery waiter/timer behind.
-				waiter.cancel();
-				throw err;
-			}
+		inject(threadId, text, opts) {
+			// Serialized per thread (see injectChains above). The uncontended case starts
+			// synchronously (same timing as before the fix); a contended call chains behind the
+			// thread's previous inject — bounded by the RPC (30s) + delivery (10s) timeouts — and
+			// a failed inject never wedges the chain (catch-link keeps the chain resolvable).
+			const prev = injectChains.get(threadId);
+			const run = prev ? prev.then(() => doInject(threadId, text, opts)) : doInject(threadId, text, opts);
+			const link = run.catch(() => {});
+			injectChains.set(threadId, link);
+			void link.then(() => {
+				if (injectChains.get(threadId) === link) injectChains.delete(threadId);
+			});
+			return run;
 		},
 		async injectItems(threadId, items) {
 			const resp = await request("thread/inject_items", { threadId, items });
