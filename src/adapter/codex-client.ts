@@ -74,22 +74,45 @@ export function spawnAppServerTransport(codexBin = "codex", opts?: SpawnTranspor
 		if (stderrTail.length > STDERR_TAIL_MAX_LINES) stderrTail.shift();
 		opts?.onStderrLine?.(line);
 	};
+	// R10 P1 fix — ONE lossless bounded segmenter for every path (complete newline-terminated
+	// lines, the in-progress fragment, and the final flush): a segment boundary never lands
+	// inside a surrogate pair (cut one unit earlier when it would strand a high surrogate), so
+	// every segment independently UTF-8 round-trips; segments concatenate back to the exact
+	// original character sequence (no truncation — the old code dropped chars 501..\n of a
+	// complete overlong line, and could split an emoji at UTF-16 index 500).
+	function pushSegmented(s: string) {
+		let i = 0;
+		while (i < s.length) {
+			let end = Math.min(i + STDERR_LINE_MAX_CHARS, s.length);
+			if (end < s.length) {
+				const c = s.charCodeAt(end - 1);
+				if (c >= 0xd800 && c <= 0xdbff) end -= 1; // never strand a high surrogate at the cut
+			}
+			pushStderrLine(s.slice(i, end));
+			i = end;
+		}
+	}
 	child.stderr?.on("data", (d) => {
 		errBuf += errDecoder.write(d);
 		let i: number;
 		while ((i = errBuf.indexOf("\n")) >= 0) {
-			pushStderrLine(errBuf.slice(0, i).slice(0, STDERR_LINE_MAX_CHARS));
+			pushSegmented(errBuf.slice(0, i));
 			errBuf = errBuf.slice(i + 1);
 		}
+		// Bound the in-progress fragment: drain full segments, keep the (<= one-limit) tail.
 		while (errBuf.length > STDERR_LINE_MAX_CHARS) {
-			pushStderrLine(errBuf.slice(0, STDERR_LINE_MAX_CHARS));
-			errBuf = errBuf.slice(STDERR_LINE_MAX_CHARS);
+			let end = STDERR_LINE_MAX_CHARS;
+			const c = errBuf.charCodeAt(end - 1);
+			if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+			pushStderrLine(errBuf.slice(0, end));
+			errBuf = errBuf.slice(end);
 		}
 	});
 	const flushStderrFragment = () => {
 		errBuf += errDecoder.end(); // any trailing partial sequence resolves here
-		if (errBuf.trim()) pushStderrLine(errBuf.slice(0, STDERR_LINE_MAX_CHARS));
+		const rest = errBuf;
 		errBuf = "";
+		if (rest.trim()) pushSegmented(rest);
 	};
 	child.stderr?.on("end", flushStderrFragment);
 	child.stderr?.on("close", flushStderrFragment);

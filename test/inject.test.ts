@@ -614,6 +614,36 @@ describe("spawnAppServerTransport stderr retention (runtime-verify P1)", () => {
 		expect(reason.split("\n").slice(1).join("\n")).toBe(drained.join("\n")); // tail = same chunks, bounded
 	});
 
+	it("KILLING (R10): a complete OVERLONG line (newline in the same event) is segmented LOSSLESSLY — chars 501+ must not be dropped", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		// 1800 chars with positional markers, then a newline in the same write.
+		const script = `let s = ""; for (let i = 0; i < 180; i++) s += String(i % 10).repeat(10); process.stderr.write(s + "\\n"); process.exitCode = 2;`;
+		const drained: string[] = [];
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script], onStderrLine: (l) => drained.push(l) });
+		await new Promise<string>((resolve) => transport.onExit(resolve));
+		let expected = "";
+		for (let i = 0; i < 180; i++) expected += String(i % 10).repeat(10);
+		expect(drained.join("")).toBe(expected); // full reassembly — the old code kept only the first 500
+		expect(drained.length).toBe(4); // 500+500+500+300
+		for (const seg of drained) expect(seg.length).toBeLessThanOrEqual(500);
+	});
+
+	it("KILLING (R10): an emoji straddling the 500-unit boundary is never split — every segment independently UTF-8 round-trips", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		// 499 ASCII + U+1F642 (surrogate pair, units 500-501) + 20 chars, newline-terminated.
+		const script = `process.stderr.write("a".repeat(499) + "\\u{1F642}" + "b".repeat(20) + "\\n"); process.exitCode = 2;`;
+		const drained: string[] = [];
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script], onStderrLine: (l) => drained.push(l) });
+		const reason = await new Promise<string>((resolve) => transport.onExit(resolve));
+		const expected = "a".repeat(499) + "\u{1F642}" + "b".repeat(20);
+		expect(drained.join("")).toBe(expected); // exact character sequence, no loss/dup
+		for (const seg of drained) {
+			// each segment must independently survive a UTF-8 round-trip (a lone surrogate cannot)
+			expect(Buffer.from(seg, "utf8").toString("utf8")).toBe(seg);
+		}
+		expect(reason).not.toContain("\uFFFD"); // the \n-joined tail carries no corrupted characters
+	});
+
 	it("KILLING (R9): the exit reason is published only after stderr FULLY drains — ~4MB in flight at child death must not lose the final line", async () => {
 		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
 		// 4MB keeps the kernel pipe saturated at death. Under the 'exit'-event mutant this lost
@@ -647,12 +677,15 @@ describe("spawnAppServerTransport stderr retention (runtime-verify P1)", () => {
 		const script = `for (let i = 0; i < 120; i++) process.stderr.write("line-" + i + "-" + "x".repeat(600) + "\\n"); process.exitCode = 1;`;
 		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script] });
 		const reason = await new Promise<string>((resolve) => transport.onExit(resolve));
-		expect(reason).not.toContain("line-69-"); // older than the 50-line window (70..119 kept)
-		expect(reason).toContain("line-70-");
+		// Each ~608-char line segments losslessly into 2 ring entries (R10), so the 50-entry
+		// ring holds exactly the last 25 complete lines: 95..119.
+		expect(reason).not.toContain("line-94-"); // older than the ring window
+		expect(reason).toContain("line-95-");
 		expect(reason).toContain("line-119-");
-		const lines = reason.split("\n").filter((l) => l.startsWith("line-"));
-		expect(lines).toHaveLength(50);
-		for (const l of lines) expect(l.length).toBeLessThanOrEqual(500);
+		const entries = reason.split("\n").slice(1); // after the "app-server exited...; stderr tail:" line
+		expect(entries).toHaveLength(50);
+		expect(entries.filter((l) => l.startsWith("line-"))).toHaveLength(25); // 25 head segments + 25 continuations
+		for (const l of entries) expect(l.length).toBeLessThanOrEqual(500);
 	});
 });
 
