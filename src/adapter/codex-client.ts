@@ -37,12 +37,10 @@ export function spawnAppServerTransport(codexBin = "codex"): Transport {
 			if (line.trim()) for (const cb of lineCbs) cb(line);
 		}
 	});
-	// spawn failure (e.g. bad bin → ENOENT) surfaces on the child, not stdin.
 	child.on("error", (err) => fireExit(`spawn error: ${String(err)}`));
 	child.on("exit", (code, signal) => fireExit(`app-server exited (code=${code}, signal=${signal})`));
 	return {
 		send: (line) => {
-			// stdin write after death would throw EPIPE; swallow — onExit already reported.
 			try {
 				child.stdin.write(line + "\n");
 			} catch {
@@ -68,15 +66,60 @@ export interface CodexErrorEvent {
 	httpStatusCode?: number;
 }
 
-/**
- * app-server → client request (id + method + params) requiring a response, e.g. command/file
- * approval, tool user-input, MCP elicitation/permissions. The handler MUST return a result
- * object; there is no safe default that auto-approves.
- */
-export interface ServerRequest {
+// ── Server → client requests (app-server asks the client), per codex 0.136.0 schema.
+// Each method has a method-specific response contract; there is no single generic shape.
+// A registered handler returns the typed result; with no handler we apply a safe
+// NON-INTERACTIVE policy: schema-shaped DENY where a decline exists, else fail closed.
+// It NEVER approves anything.
+export type ServerRequestMethod =
+	| "item/commandExecution/requestApproval"
+	| "item/fileChange/requestApproval"
+	| "execCommandApproval"
+	| "applyPatchApproval"
+	| "item/tool/requestUserInput"
+	| "mcpServer/elicitation/request"
+	| "item/permissions/requestApproval"
+	| "item/tool/call";
+
+export interface ServerRequest<M extends string = string> {
 	id: number | string;
-	method: string;
+	method: M;
 	params: unknown;
+}
+
+// Method → response result type (subset of the schema we can answer non-interactively).
+export type ServerRequestResult =
+	| { decision: "accept" | "acceptForSession" | "decline" | "cancel" } // command/file approval
+	| { decision: "approved" | "approved_for_session" | "denied" | "timed_out" | "abort" } // exec/patch (ReviewDecision)
+	| { answers: Record<string, unknown> } // tool user-input
+	| { action: "accept" | "decline" | "cancel" }; // MCP elicitation
+
+/** Handler answers with a typed result, or throws to fail the request closed. */
+export type ServerRequestHandler = (req: ServerRequest<ServerRequestMethod | string>) => Promise<ServerRequestResult>;
+
+/**
+ * Non-interactive default: return a schema-shaped DENY for methods where one exists so the
+ * turn proceeds (denied) instead of hanging; fail closed (JSON-RPC error) for methods with no
+ * safe automatic response (granting permissions, running a tool, token refresh, attestation).
+ * Never approves.
+ */
+export function defaultServerRequestResponse(method: string): { result: object } | { error: { code: number; message: string } } {
+	switch (method) {
+		case "item/commandExecution/requestApproval":
+		case "item/fileChange/requestApproval":
+			return { result: { decision: "decline" } };
+		case "execCommandApproval":
+		case "applyPatchApproval":
+			return { result: { decision: "denied" } };
+		case "item/tool/requestUserInput":
+			return { result: { answers: {} } };
+		case "mcpServer/elicitation/request":
+			return { result: { action: "decline" } };
+		default:
+			// permissions grant / tool call / token refresh / attestation / unknown:
+			// no safe non-interactive shape → fail closed, never approve.
+			return { error: { code: -32601, message: `server request ${method} not supported non-interactively; denied` } };
+	}
 }
 
 export interface InjectOutcome {
@@ -96,7 +139,8 @@ export interface CodexClient {
 	 * Wake path: steer the thread's active turn if one exists, else start a new turn.
 	 * `delivered` flips true only after the injected message is confirmed in
 	 * model-visible history (item/completed with our clientUserMessageId) —
-	 * the ok:true gate (invariants.ts). Rejects if the transport disconnects.
+	 * the ok:true gate (invariants.ts). Rejects if the transport disconnects; any
+	 * terminal failure cancels the delivery waiter (no leaked timers).
 	 */
 	inject(threadId: string, text: string, opts?: { deliveryTimeoutMs?: number }): Promise<InjectOutcome>;
 	/** Context-only append (no turn started); items are raw Responses API shapes. */
@@ -105,13 +149,15 @@ export interface CodexClient {
 	onTurnCompleted(cb: (e: { threadId: string; turnId: string }) => void): void;
 	onError(cb: (e: CodexErrorEvent) => void): void;
 	/**
-	 * Register the handler for app-server→client requests (approvals, tool input…).
-	 * Return a result object to answer; return/throw with no handler set →
-	 * the request is denied (a JSON-RPC error), never silently ignored or auto-approved.
+	 * Register the typed handler for app-server→client requests (approvals, tool input…).
+	 * With no handler, the non-interactive default policy applies (DENY / fail closed);
+	 * a request is never silently ignored or auto-approved.
 	 */
-	onServerRequest(handler: (req: ServerRequest) => Promise<object>): void;
+	onServerRequest(handler: ServerRequestHandler): void;
 	/** True until the transport disconnects. */
 	isConnected(): boolean;
+	/** Observability (P2): outstanding delivery waiters — asserted 0 after terminal failures. */
+	pendingDeliveryCount(): number;
 }
 
 interface JsonRpcResponse {
@@ -129,10 +175,7 @@ export function activeTurnIdFromSteerError(message: string): string | null {
 	return m ? m[1] : null;
 }
 
-export function createCodexClient(
-	transport: Transport,
-	opts?: { requestTimeoutMs?: number },
-): CodexClient {
+export function createCodexClient(transport: Transport, opts?: { requestTimeoutMs?: number }): CodexClient {
 	const requestTimeoutMs = opts?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 	let nextId = 0;
 	const pending = new Map<number, { resolve: (r: JsonRpcResponse) => void; timer: ReturnType<typeof setTimeout> }>();
@@ -143,7 +186,7 @@ export function createCodexClient(
 	const agentMessageCbs: Array<(e: AgentMessageEvent) => void> = [];
 	const turnCompletedCbs: Array<(e: { threadId: string; turnId: string }) => void> = [];
 	const errorCbs: Array<(e: CodexErrorEvent) => void> = [];
-	let serverRequestHandler: ((req: ServerRequest) => Promise<object>) | null = null;
+	let serverRequestHandler: ServerRequestHandler | null = null;
 	let connected = true;
 
 	function request(method: string, params: unknown): Promise<JsonRpcResponse> {
@@ -199,10 +242,7 @@ export function createCodexClient(
 		if (msg.id !== undefined && typeof msg.method === "string") {
 			const req: ServerRequest = { id: msg.id, method: msg.method, params: msg.params };
 			if (!serverRequestHandler) {
-				// No handler → deny (never auto-approve, never silently drop).
-				respond(msg.id, {
-					error: { code: -32601, message: `no handler for server request ${msg.method}; denied` },
-				});
+				respond(msg.id, defaultServerRequestResponse(msg.method));
 				return;
 			}
 			serverRequestHandler(req)
@@ -256,22 +296,33 @@ export function createCodexClient(
 		}
 	});
 
-	function waitDelivered(clientId: string, timeoutMs: number): Promise<boolean> {
-		if (!connected) return Promise.resolve(false);
-		return new Promise((resolve) => {
+	// Delivery waiter tied to a single injection attempt; cancel() clears the timer + map
+	// entry so a terminal RPC failure (P2#3) can't leak it until the delivery deadline.
+	function createDeliveryWaiter(clientId: string, timeoutMs: number) {
+		if (!connected) return { promise: Promise.resolve(false), cancel: () => {} };
+		let settle: (ok: boolean) => void;
+		const promise = new Promise<boolean>((resolve) => {
+			settle = resolve;
 			const timer = setTimeout(() => {
 				awaitingDelivery.delete(clientId);
 				resolve(false);
 			}, timeoutMs);
 			awaitingDelivery.set(clientId, { resolve, timer });
 		});
+		const cancel = () => {
+			const entry = awaitingDelivery.get(clientId);
+			if (entry) {
+				clearTimeout(entry.timer);
+				awaitingDelivery.delete(clientId);
+				settle(false);
+			}
+		};
+		return { promise, cancel };
 	}
 
 	return {
 		async start() {
-			const resp = await request("initialize", {
-				clientInfo: { name: "codex-openmax", version: "0.0.0" },
-			});
+			const resp = await request("initialize", { clientInfo: { name: "codex-openmax", version: "0.0.0" } });
 			if (resp.error) throw new Error(`initialize failed: ${resp.error.message}`);
 			transport.send(JSON.stringify({ jsonrpc: "2.0", method: "initialized" }));
 		},
@@ -289,29 +340,42 @@ export function createCodexClient(
 			const clientUserMessageId = randomUUID();
 			const input = [{ type: "text", text }];
 			const timeoutMs = opts?.deliveryTimeoutMs ?? DEFAULT_DELIVERY_TIMEOUT_MS;
-			const deliveredP = waitDelivered(clientUserMessageId, timeoutMs);
+			const waiter = createDeliveryWaiter(clientUserMessageId, timeoutMs);
 
-			const startTurn = async (): Promise<InjectOutcome> => {
-				const resp = await request("turn/start", { threadId, input, clientUserMessageId });
-				if (resp.error) throw new Error(`turn/start failed: ${resp.error.message}`);
-				return { turnId: resp.result.turn.id, delivered: await deliveredP, mode: "turn/start" };
-			};
+			try {
+				const startTurn = async (): Promise<InjectOutcome> => {
+					const resp = await request("turn/start", { threadId, input, clientUserMessageId });
+					if (resp.error) throw new Error(`turn/start failed: ${resp.error.message}`);
+					const turnId = resp.result.turn.id;
+					activeTurns.set(threadId, turnId);
+					return { turnId, delivered: await waiter.promise, mode: "turn/start" };
+				};
 
-			const expected = activeTurns.get(threadId);
-			if (!expected) return startTurn();
+				const expected = activeTurns.get(threadId);
+				if (!expected) return await startTurn();
 
-			let resp = await request("turn/steer", { threadId, expectedTurnId: expected, input, clientUserMessageId });
-			if (resp.error) {
-				// CAS lost: the error carries the real active id — retry once with it;
-				// fall back to turn/start when the turn ended meanwhile.
-				const realId = activeTurnIdFromSteerError(resp.error.message);
-				if (realId) {
-					resp = await request("turn/steer", { threadId, expectedTurnId: realId, input, clientUserMessageId });
-					if (!resp.error) return { turnId: realId, delivered: await deliveredP, mode: "turn/steer" };
+				let resp = await request("turn/steer", { threadId, expectedTurnId: expected, input, clientUserMessageId });
+				if (resp.error) {
+					// CAS lost: the error carries the real active id — retry once with it;
+					// fall back to turn/start when the turn ended meanwhile.
+					const realId = activeTurnIdFromSteerError(resp.error.message);
+					if (realId) {
+						resp = await request("turn/steer", { threadId, expectedTurnId: realId, input, clientUserMessageId });
+						if (!resp.error) {
+							// P2#2 fix: write back the recovered id so the next wake steers it and
+							// turn/completed(realId) can clear it.
+							activeTurns.set(threadId, realId);
+							return { turnId: realId, delivered: await waiter.promise, mode: "turn/steer" };
+						}
+					}
+					return await startTurn();
 				}
-				return startTurn();
+				return { turnId: expected, delivered: await waiter.promise, mode: "turn/steer" };
+			} catch (err) {
+				// P2#3 fix: terminal failure must not leave the delivery waiter/timer behind.
+				waiter.cancel();
+				throw err;
 			}
-			return { turnId: expected, delivered: await deliveredP, mode: "turn/steer" };
 		},
 		async injectItems(threadId, items) {
 			const resp = await request("thread/inject_items", { threadId, items });
@@ -324,5 +388,6 @@ export function createCodexClient(
 			serverRequestHandler = handler;
 		},
 		isConnected: () => connected,
+		pendingDeliveryCount: () => awaitingDelivery.size,
 	};
 }
