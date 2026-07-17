@@ -44,6 +44,16 @@ The OpenAI Codex **CLI** is the only surface exposing a stable programmatic inje
 | **P2 Hardening** | ok:true invariant + verification; failureClass + backoff; no-turn/backpressure/concurrent wakes; outbound streaming | contract invariants + edge cases |
 | **P3 Integration** | Workspace scheduling adapter; live end-to-end; regression tests | end-to-end green |
 
+## Deferred to P2 Hardening (owner decision A — merge-now-harden-later, 2026-07-17)
+
+- **Full-fidelity server-request contract** (from PR #1 R5 review): today the handler types + runtime
+  validator model the answerable methods faithfully — structured decision variants
+  (execpolicy / network-policy amendments) + deep JsonValue validation — and fail closed on the
+  four no-safe-default methods. Still to do when the approval path is actually integrated: derive/
+  import the pinned official generated bindings, model all 10 methods' `params` exactly, and
+  generate conformance fixtures from the same authoritative schema. Until a handler is registered,
+  the safe default-deny policy runs (no runtime exposure), which is why this is P2, not a P1 merge gate.
+
 ## Open items (from review of the proposal)
 
 - Shared SDK boundary: it must NOT pull in `zylos-openmax`-specific pieces (WS→session injection, auto-upgrade, cf-access, access-control config, memory/scheduler).
