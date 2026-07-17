@@ -67,7 +67,10 @@ export async function main(bridge: CwsBridge = createMockCwsBridge()): Promise<R
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify(wake),
 			});
-			return (await res.json()) as WakeResponse;
+			const resp = (await res.json()) as WakeResponse;
+			// Observability: a failed wake must say WHY (the SDK log only shows ok=false).
+			if (!resp.ok) log(`wake failed msg=${wake.messageId} conv=${wake.conversationId}: ${JSON.stringify(resp)}`);
+			return resp;
 		} catch (e) {
 			log(`inbound /wake failed: ${String(e)}`);
 			return { ok: false, failureClass: "runtime_error", retryAfterMs: 15_000 };

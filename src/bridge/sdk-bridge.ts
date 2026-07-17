@@ -44,14 +44,20 @@ export type SdkInboundDeliver = (msg: SdkInboundMessage, endpoint: string, prior
 /** contentPreview is "short, non-authoritative" (wake-request.schema.json) — cap it. */
 const PREVIEW_MAX = 480;
 export function toWakeRequest(msg: SdkInboundMessage): WakeRequest {
+	// LIVE finding (openmax.com, 2026-07-18): the real server delivers message ids as JSON
+	// NUMBERS (e.g. 1784124726965) even though inbound-message.schema.json declares
+	// messageId:string (the SDK's fixtures all use string ids, so its contract test never
+	// catches the drift — reported upstream). The wake-request contract requires strings,
+	// so coerce at this boundary; wake-queue dedup keys stay strings either way.
+	const text = String(msg.text ?? "");
 	return {
 		schema: WAKE_SCHEMA,
-		messageId: msg.messageId,
-		conversationId: msg.conversationId,
+		messageId: String(msg.messageId),
+		conversationId: String(msg.conversationId),
 		// senderId is REQUIRED (string) on the wire but optional on InboundMessage —
 		// an unresolved sender maps to "" (schema-valid; the runtime treats it as unknown).
-		senderId: msg.senderId ?? "",
-		contentPreview: msg.text.length > PREVIEW_MAX ? msg.text.slice(0, PREVIEW_MAX) : msg.text,
+		senderId: msg.senderId == null ? "" : String(msg.senderId),
+		contentPreview: text.length > PREVIEW_MAX ? text.slice(0, PREVIEW_MAX) : text,
 	};
 }
 
