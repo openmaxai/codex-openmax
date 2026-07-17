@@ -72,17 +72,23 @@ export interface CodexErrorEvent {
 // cross-method result is a compile error and is also rejected at runtime. With no handler
 // for a method we apply a NON-INTERACTIVE policy: schema-shaped DENY where a decline exists,
 // else fail closed. It NEVER approves anything.
-// Decision types mirror the pinned Codex stable schema (0.136.0 / 0.144.3), including the
-// STRUCTURED amendment variants — a string-only union would wrongly reject legit results.
-type ExecPolicyAmendment = Record<string, JsonValue>;
-type NetworkPolicyAmendment = Record<string, JsonValue>;
-export type ApprovalDecision =
+// Decision types mirror the pinned Codex stable schema (0.136.0 / 0.144.3) EXACTLY:
+// ExecPolicyAmendment = string[]; NetworkPolicyAmendment = {host, action}; structured amendment
+// variants belong ONLY to command approval + exec/patch review — file-change is strings only.
+export type ExecPolicyAmendment = string[];
+export type NetworkPolicyRuleAction = "allow" | "deny";
+export type NetworkPolicyAmendment = { host: string; action: NetworkPolicyRuleAction };
+/** `item/commandExecution/requestApproval` decision (v2 CommandExecutionApprovalDecision). */
+export type CommandExecutionApprovalDecision =
 	| "accept"
 	| "acceptForSession"
 	| { acceptWithExecpolicyAmendment: { execpolicy_amendment: ExecPolicyAmendment } }
 	| { applyNetworkPolicyAmendment: { network_policy_amendment: NetworkPolicyAmendment } }
 	| "decline"
 	| "cancel";
+/** `item/fileChange/requestApproval` decision — strings only, NO structured variants. */
+export type FileChangeApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
+/** `execCommandApproval` / `applyPatchApproval` decision (ReviewDecision). */
 export type ReviewDecision =
 	| "approved"
 	| { approved_execpolicy_amendment: { proposed_execpolicy_amendment: ExecPolicyAmendment } }
@@ -106,8 +112,8 @@ export interface UserInputAnswer {
  * its response-result type. `never` = no safe non-interactive result exists → must fail closed.
  */
 export interface ServerRequestResultMap {
-	"item/commandExecution/requestApproval": { decision: ApprovalDecision };
-	"item/fileChange/requestApproval": { decision: ApprovalDecision };
+	"item/commandExecution/requestApproval": { decision: CommandExecutionApprovalDecision };
+	"item/fileChange/requestApproval": { decision: FileChangeApprovalDecision };
 	execCommandApproval: { decision: ReviewDecision };
 	applyPatchApproval: { decision: ReviewDecision };
 	"item/tool/requestUserInput": { answers: Record<string, UserInputAnswer> };
@@ -164,15 +170,27 @@ export type ServerRequestHandlers = {
 	[M in ServerRequestMethod]?: (req: ServerRequest<M>) => Promise<ServerRequestResultMap[M]>;
 };
 
-const APPROVAL_STRINGS: ReadonlySet<string> = new Set(["accept", "acceptForSession", "decline", "cancel"]);
-const APPROVAL_AMENDMENT_KEYS: ReadonlySet<string> = new Set(["acceptWithExecpolicyAmendment", "applyNetworkPolicyAmendment"]);
-const REVIEW_STRINGS: ReadonlySet<string> = new Set(["approved", "approved_for_session", "denied", "timed_out", "abort"]);
-const REVIEW_AMENDMENT_KEYS: ReadonlySet<string> = new Set(["approved_execpolicy_amendment", "network_policy_amendment"]);
+const COMMAND_DECISION_STRINGS: ReadonlySet<string> = new Set(["accept", "acceptForSession", "decline", "cancel"]);
+const FILECHANGE_DECISION_STRINGS: ReadonlySet<string> = new Set(["accept", "acceptForSession", "decline", "cancel"]);
+const REVIEW_DECISION_STRINGS: ReadonlySet<string> = new Set(["approved", "approved_for_session", "denied", "timed_out", "abort"]);
 const ELICITATION_ACTIONS: ReadonlySet<string> = new Set(["accept", "decline", "cancel"]);
+const NETWORK_POLICY_ACTIONS: ReadonlySet<string> = new Set(["allow", "deny"]);
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 /** True iff `obj`'s keys are all within `allowed` (rejects extra / cross-method fields). */
 const onlyKeys = (obj: Record<string, unknown>, allowed: readonly string[]) => Object.keys(obj).every((k) => allowed.includes(k));
+
+/** ExecPolicyAmendment = string[]. */
+const isExecPolicyAmendment = (v: unknown): boolean => Array.isArray(v) && v.every((s) => typeof s === "string");
+/** NetworkPolicyAmendment = exactly { host: string, action: "allow"|"deny" }. */
+const isNetworkPolicyAmendment = (v: unknown): boolean =>
+	isObj(v) && onlyKeys(v, ["host", "action"]) && typeof v.host === "string" && typeof v.action === "string" && NETWORK_POLICY_ACTIONS.has(v.action);
+/** A wrapper object `{ [wrapperKey]: { [innerKey]: <inner> } }` with exact single keys. */
+function isAmendmentWrapper(d: Record<string, unknown>, wrapperKey: string, innerKey: string, innerOk: (v: unknown) => boolean): boolean {
+	if (!onlyKeys(d, [wrapperKey])) return false;
+	const inner = d[wrapperKey];
+	return isObj(inner) && onlyKeys(inner, [innerKey]) && innerOk(inner[innerKey]);
+}
 
 /** True iff `v` is a pure JSON value (rejects function/symbol/undefined/bigint anywhere nested). */
 export function isJsonValue(v: unknown): boolean {
@@ -191,30 +209,43 @@ export function isJsonValue(v: unknown): boolean {
 	}
 }
 
-/** A decision is either an allowed enum string, or exactly one allowed structured amendment object (JSON-valued). */
-function isValidDecision(d: unknown, strings: ReadonlySet<string>, amendmentKeys: ReadonlySet<string>): boolean {
-	if (typeof d === "string") return strings.has(d);
+/** command approval: strings OR the two exact command structured variants. */
+function isValidCommandDecision(d: unknown): boolean {
+	if (typeof d === "string") return COMMAND_DECISION_STRINGS.has(d);
 	if (!isObj(d)) return false;
-	const keys = Object.keys(d);
-	return keys.length === 1 && amendmentKeys.has(keys[0]) && isJsonValue(d[keys[0]]);
+	return (
+		isAmendmentWrapper(d, "acceptWithExecpolicyAmendment", "execpolicy_amendment", isExecPolicyAmendment) ||
+		isAmendmentWrapper(d, "applyNetworkPolicyAmendment", "network_policy_amendment", isNetworkPolicyAmendment)
+	);
+}
+/** exec/patch review: strings OR the two exact review structured variants. */
+function isValidReviewDecision(d: unknown): boolean {
+	if (typeof d === "string") return REVIEW_DECISION_STRINGS.has(d);
+	if (!isObj(d)) return false;
+	return (
+		isAmendmentWrapper(d, "approved_execpolicy_amendment", "proposed_execpolicy_amendment", isExecPolicyAmendment) ||
+		isAmendmentWrapper(d, "network_policy_amendment", "network_policy_amendment", isNetworkPolicyAmendment)
+	);
 }
 
 /**
- * Runtime guard: does `result` EXACTLY match `method`'s schema (valid enum OR structured
- * amendment variant, no extra/cross-method keys, full nested shape, and every nested value a
- * pure JSON value)? Defends against any-cast / JS callers that bypass the compile-time typing.
- * Anything not matching → fail closed.
+ * Runtime guard: does `result` EXACTLY match `method`'s schema (valid enum OR the method's exact
+ * structured amendment variant with exact inner shape — ExecPolicyAmendment=string[],
+ * NetworkPolicyAmendment={host,action∈{allow,deny}} — no extra/cross-method keys, and every
+ * nested value a pure JSON value)? file-change has NO structured variants. Defends against
+ * any-cast / JS callers that bypass compile-time typing. Anything not matching → fail closed.
  */
 export function isValidServerResult(method: string, result: unknown): boolean {
 	if (!isObj(result) || !isJsonValue(result)) return false;
 	const r = result;
 	switch (method) {
 		case "item/commandExecution/requestApproval":
+			return onlyKeys(r, ["decision"]) && isValidCommandDecision(r.decision);
 		case "item/fileChange/requestApproval":
-			return onlyKeys(r, ["decision"]) && isValidDecision(r.decision, APPROVAL_STRINGS, APPROVAL_AMENDMENT_KEYS);
+			return onlyKeys(r, ["decision"]) && typeof r.decision === "string" && FILECHANGE_DECISION_STRINGS.has(r.decision);
 		case "execCommandApproval":
 		case "applyPatchApproval":
-			return onlyKeys(r, ["decision"]) && isValidDecision(r.decision, REVIEW_STRINGS, REVIEW_AMENDMENT_KEYS);
+			return onlyKeys(r, ["decision"]) && isValidReviewDecision(r.decision);
 		case "item/tool/requestUserInput": {
 			if (!onlyKeys(r, ["answers"]) || !isObj(r.answers)) return false;
 			// each answer must be exactly { answers: string[] }

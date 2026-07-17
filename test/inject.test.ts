@@ -339,21 +339,40 @@ describe("codex-client server request handling (P1#3)", () => {
 		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: "decline" })).toBe(true);
 		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: "approved" })).toBe(false); // wrong enum (review, not approval)
 		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: "decline", extra: 1 })).toBe(false); // extra key
+		// file-change: strings ONLY — structured variants must be REJECTED (R6)
+		expect(isValidServerResult("item/fileChange/requestApproval", { decision: "accept" })).toBe(true);
+		expect(
+			isValidServerResult("item/fileChange/requestApproval", {
+				decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["ls"] } },
+			}),
+		).toBe(false); // file-change has no structured variant
 		// exec/patch review
 		expect(isValidServerResult("execCommandApproval", { decision: "denied" })).toBe(true);
 		expect(isValidServerResult("execCommandApproval", { decision: "decline" })).toBe(false); // approval enum, not review
-		// STRUCTURED decision variants are legit and must be accepted (were wrongly rejected before)
+		// STRUCTURED variants with EXACT inner shape (R6: ExecPolicyAmendment=string[], NetworkPolicyAmendment={host,action})
 		expect(
-			isValidServerResult("execCommandApproval", { decision: { approved_execpolicy_amendment: { proposed_execpolicy_amendment: {} } } }),
+			isValidServerResult("execCommandApproval", { decision: { approved_execpolicy_amendment: { proposed_execpolicy_amendment: ["git", "log"] } } }),
 		).toBe(true);
 		expect(
 			isValidServerResult("item/commandExecution/requestApproval", {
-				decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { host: "x" } } },
+				decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { host: "x.com", action: "allow" } } },
 			}),
 		).toBe(true);
+		expect(
+			isValidServerResult("item/commandExecution/requestApproval", {
+				decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["npm"] } },
+			}),
+		).toBe(true);
+		// R6 negatives: wrong inner types / missing required / extra keys / cross-method variant
+		expect(isValidServerResult("execCommandApproval", { decision: { approved_execpolicy_amendment: { proposed_execpolicy_amendment: {} } } })).toBe(false); // object, not string[]
+		expect(isValidServerResult("execCommandApproval", { decision: { approved_execpolicy_amendment: { proposed_execpolicy_amendment: [1] } } })).toBe(false); // non-string element
+		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { host: "x" } } } })).toBe(false); // missing action
+		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { host: "x", action: "maybe" } } } })).toBe(false); // bad action enum
+		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { host: "x", action: "allow", extra: 1 } } } })).toBe(false); // extra inner key
+		// command variant used on exec/patch (cross-variant) must be rejected
+		expect(isValidServerResult("execCommandApproval", { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["x"] } } })).toBe(false);
 		expect(isValidServerResult("execCommandApproval", { decision: { bogus_amendment: {} } })).toBe(false); // unknown variant
 		// non-JSON nested value must be rejected (can't round-trip on the wire)
-		expect(isValidServerResult("execCommandApproval", { decision: { approved_execpolicy_amendment: { fn: () => 1 } } })).toBe(false);
 		expect(isValidServerResult("mcpServer/elicitation/request", { action: "decline", content: { bad: undefined } })).toBe(false);
 		// user-input: nested { answers: { [q]: { answers: string[] } } }
 		expect(isValidServerResult("item/tool/requestUserInput", { answers: {} })).toBe(true);

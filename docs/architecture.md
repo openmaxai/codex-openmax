@@ -46,13 +46,16 @@ The OpenAI Codex **CLI** is the only surface exposing a stable programmatic inje
 
 ## Deferred to P2 Hardening (owner decision A — merge-now-harden-later, 2026-07-17)
 
-- **Full-fidelity server-request contract** (from PR #1 R5 review): today the handler types + runtime
-  validator model the answerable methods faithfully — structured decision variants
-  (execpolicy / network-policy amendments) + deep JsonValue validation — and fail closed on the
-  four no-safe-default methods. Still to do when the approval path is actually integrated: derive/
-  import the pinned official generated bindings, model all 10 methods' `params` exactly, and
-  generate conformance fixtures from the same authoritative schema. Until a handler is registered,
-  the safe default-deny policy runs (no runtime exposure), which is why this is P2, not a P1 merge gate.
+- **Full-fidelity server-request contract** (from PR #1 R5/R6 review): the answerable methods' RESULT
+  types + runtime validator are now schema-exact — command approval vs file-change decisions are
+  distinct (file-change is strings only, no structured variants), the command/exec-review structured
+  amendment variants use the exact inner shapes (`ExecPolicyAmendment = string[]`,
+  `NetworkPolicyAmendment = {host, action∈{allow,deny}}`) with required/enum/no-extra + deep
+  JsonValue validation, and the four no-safe-default methods fail closed. Still deferred to P2 (owner
+  decision A): derive/import the pinned official generated bindings wholesale and model all 10
+  methods' `params` exactly + generate conformance fixtures from the same authoritative schema.
+  Until a handler is registered the safe default-deny policy runs (no runtime exposure), which is why
+  the remaining binding/params/fixtures work is P2, not a P1 merge gate.
 
 ## Open items (from review of the proposal)
 
