@@ -321,6 +321,109 @@ describe("codex-client server request handling (P1#3)", () => {
 		expect(resp.result).toBeUndefined();
 	});
 
+	// R7/R8: the guard must validate the WIRE form, not the live object. Each case below passes
+	// a live-object check but serializes to schema-invalid bytes — all must be rejected.
+	it("KILLING (R7): sparse user-input answers array (holes → [null] on wire) is rejected", async () => {
+		const { client, sent, emit } = await startedClient({});
+		client.onServerRequest({
+			// live: Array.every skips the hole so element-type checks pass; wire: [null]
+			"item/tool/requestUserInput": (async () => ({ answers: { q: { answers: new Array(1) } } })) as never,
+		});
+		emit({ id: 1100, method: "item/tool/requestUserInput", params: {} });
+		await new Promise((r) => setTimeout(r, 0));
+		const resp = sent.find((m) => m.id === 1100);
+		expect(resp.error, "sparse answers array must be rejected, not sent as [null]").toBeDefined();
+		expect(resp.result).toBeUndefined();
+		expect(JSON.stringify(sent)).not.toContain("[null]");
+	});
+
+	it("KILLING (R7): sparse execpolicy string[] (hole → null amendment on wire) is rejected", async () => {
+		const { client, sent, emit } = await startedClient({});
+		client.onServerRequest({
+			"item/commandExecution/requestApproval": (async () => ({
+				decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: new Array(1) } },
+			})) as never,
+		});
+		emit({ id: 1101, method: "item/commandExecution/requestApproval", params: {} });
+		await new Promise((r) => setTimeout(r, 0));
+		const resp = sent.find((m) => m.id === 1101);
+		expect(resp.error, "sparse execpolicy_amendment must be rejected").toBeDefined();
+		expect(resp.result).toBeUndefined();
+	});
+
+	it("KILLING (R7): inherited required prop (Object.create({decision}) → {} on wire) is rejected", async () => {
+		const { client, sent, emit } = await startedClient({});
+		client.onServerRequest({
+			// live: Object.keys=[] passes onlyKeys vacuously and r.decision reads the prototype;
+			// wire: stringify drops inherited props → {} (missing required `decision`)
+			"item/fileChange/requestApproval": (async () => Object.create({ decision: "decline" })) as never,
+		});
+		emit({ id: 1102, method: "item/fileChange/requestApproval", params: {} });
+		await new Promise((r) => setTimeout(r, 0));
+		const resp = sent.find((m) => m.id === 1102);
+		expect(resp.error, "inherited decision must be rejected, not sent as {}").toBeDefined();
+		expect(resp.result).toBeUndefined();
+	});
+
+	it("KILLING (R7): nested inherited required prop (user-input answer via prototype) is rejected", async () => {
+		const { client, sent, emit } = await startedClient({});
+		client.onServerRequest({
+			// live: the nested answer object reads `answers` off its prototype; wire: {}
+			"item/tool/requestUserInput": (async () => ({ answers: { q: Object.create({ answers: ["x"] }) } })) as never,
+		});
+		emit({ id: 1103, method: "item/tool/requestUserInput", params: {} });
+		await new Promise((r) => setTimeout(r, 0));
+		const resp = sent.find((m) => m.id === 1103);
+		expect(resp.error, "nested inherited answers must be rejected").toBeDefined();
+		expect(resp.result).toBeUndefined();
+	});
+
+	it("KILLING (R7): toJSON drift (live-valid object whose toJSON serializes invalid) is rejected", async () => {
+		const { client, sent, emit } = await startedClient({});
+		// Non-enumerable toJSON: invisible to Object.keys (live checks pass on {decision:"decline"}),
+		// but stringify calls it and emits {} — the wire form is what must be validated.
+		const drifting = Object.defineProperty({ decision: "decline" }, "toJSON", {
+			value: () => ({}),
+			enumerable: false,
+		});
+		client.onServerRequest({
+			"item/fileChange/requestApproval": (async () => drifting) as never,
+		});
+		emit({ id: 1104, method: "item/fileChange/requestApproval", params: {} });
+		await new Promise((r) => setTimeout(r, 0));
+		const resp = sent.find((m) => m.id === 1104);
+		expect(resp.error, "toJSON-drifted result must be rejected").toBeDefined();
+		expect(resp.result).toBeUndefined();
+	});
+
+	it("KILLING (R7): unserializable handler result (circular) fails closed, not thrown", async () => {
+		const { client, sent, emit } = await startedClient({});
+		const circular: Record<string, unknown> = { decision: "decline" };
+		circular.self = circular;
+		client.onServerRequest({
+			"item/fileChange/requestApproval": (async () => circular) as never,
+		});
+		emit({ id: 1105, method: "item/fileChange/requestApproval", params: {} });
+		await new Promise((r) => setTimeout(r, 0));
+		const resp = sent.find((m) => m.id === 1105);
+		expect(resp.error, "circular result must produce a -32603 error response").toBeDefined();
+		expect(resp.error.code).toBe(-32603);
+	});
+
+	it("(R7 positive control) a valid handler result still goes out, and the sent bytes equal the validated form", async () => {
+		const { client, sent, emit } = await startedClient({});
+		client.onServerRequest({
+			"item/commandExecution/requestApproval": async () => ({
+				decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["ls"] } },
+			}),
+		});
+		emit({ id: 1106, method: "item/commandExecution/requestApproval", params: {} });
+		await new Promise((r) => setTimeout(r, 0));
+		const resp = sent.find((m) => m.id === 1106);
+		expect(resp.result).toEqual({ decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["ls"] } } });
+		expect(resp.error).toBeUndefined();
+	});
+
 	it("KILLING: a handler returning a schema-invalid NESTED user-input shape is rejected", async () => {
 		const { client, sent, emit } = await startedClient({});
 		client.onServerRequest({

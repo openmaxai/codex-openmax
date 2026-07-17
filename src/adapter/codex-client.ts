@@ -403,6 +403,37 @@ export function createCodexClient(transport: Transport, opts?: { requestTimeoutM
 		transport.send(JSON.stringify({ jsonrpc: "2.0", id, ...body }));
 	}
 
+	// R7 fix: validate the WIRE value, not the live JS object. A live object can pass the
+	// guard yet serialize to something schema-invalid: sparse arrays (`new Array(1)` — every()
+	// skips holes but stringify emits null), inherited required props (`Object.create({...})` —
+	// prototype reads pass, stringify drops them to {}), and toJSON/getter re-serialization
+	// drift. Canonicalize ONCE: stringify the full envelope, re-parse, validate the re-parsed
+	// result, and send exactly the bytes that were validated. stringify throw / undefined /
+	// re-parse failure all fail closed (-32603), never a silently-drifted response.
+	function respondWithValidatedResult(id: number | string, method: string, result: unknown) {
+		let wire: string | undefined;
+		try {
+			wire = JSON.stringify({ jsonrpc: "2.0", id, result });
+		} catch {
+			wire = undefined; // circular / bigint: not serializable
+		}
+		if (wire !== undefined) {
+			let parsed: { result?: unknown } | undefined;
+			try {
+				parsed = JSON.parse(wire);
+			} catch {
+				parsed = undefined;
+			}
+			if (parsed && isValidServerResult(method, parsed.result)) {
+				transport.send(wire); // the exact bytes the guard approved
+				return;
+			}
+		}
+		respond(id, {
+			error: { code: -32603, message: `handler returned invalid result shape for ${method}` },
+		});
+	}
+
 	transport.onLine((line) => {
 		let msg: any;
 		try {
@@ -434,14 +465,9 @@ export function createCodexClient(transport: Transport, opts?: { requestTimeoutM
 			handler({ id: msg.id, method, params: msg.params } as ServerRequest)
 				.then((result) => {
 					// Runtime guard: never forward a shape Codex can't decode, even if a JS/any-cast
-					// caller bypassed the compile-time per-method typing.
-					if (isValidServerResult(method, result)) {
-						respond(msg.id, { result });
-					} else {
-						respond(msg.id, {
-							error: { code: -32603, message: `handler returned invalid result shape for ${method}` },
-						});
-					}
+					// caller bypassed the compile-time per-method typing. Validation runs on the
+					// canonicalized wire form (R7): what is checked is exactly what is sent.
+					respondWithValidatedResult(msg.id, method, result);
 				})
 				.catch((err) => respond(msg.id, { error: { code: -32000, message: `handler error: ${String(err)}` } }));
 			return;

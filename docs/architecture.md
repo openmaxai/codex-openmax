@@ -51,7 +51,11 @@ The OpenAI Codex **CLI** is the only surface exposing a stable programmatic inje
   distinct (file-change is strings only, no structured variants), the command/exec-review structured
   amendment variants use the exact inner shapes (`ExecPolicyAmendment = string[]`,
   `NetworkPolicyAmendment = {host, action∈{allow,deny}}`) with required/enum/no-extra + deep
-  JsonValue validation, and the four no-safe-default methods fail closed. Still deferred to P2 (owner
+  JsonValue validation, and the four no-safe-default methods fail closed. Validation runs on the
+  canonicalized WIRE form (from R7): the response envelope is serialized once, the re-parsed result
+  is what the guard checks, and the exact validated bytes are what get sent — so sparse-array
+  holes, inherited required props, and toJSON/getter drift cannot pass the guard yet emit
+  schema-invalid bytes. Still deferred to P2 (owner
   decision A): derive/import the pinned official generated bindings wholesale and model all 10
   methods' `params` exactly + generate conformance fixtures from the same authoritative schema.
   Until a handler is registered the safe default-deny policy runs (no runtime exposure), which is why
