@@ -644,6 +644,42 @@ describe("spawnAppServerTransport stderr retention (runtime-verify P1)", () => {
 		expect(reason).not.toContain("\uFFFD"); // the \n-joined tail carries no corrupted characters
 	});
 
+	it("KILLING (R11): whitespace segments inside a NON-blank logical line are preserved — 500 spaces + ERROR reassembles to all 505 chars", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		const script = `process.stderr.write(" ".repeat(500) + "ERROR" + "\\n"); process.exitCode = 2;`;
+		const drained: string[] = [];
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script], onStderrLine: (l) => drained.push(l) });
+		await new Promise<string>((resolve) => transport.onExit(resolve));
+		expect(drained.join("")).toBe(" ".repeat(500) + "ERROR"); // 505 chars, spaces intact
+	});
+
+	it("KILLING (R11): the same 500-spaces+ERROR WITHOUT a newline (flush path) also reassembles losslessly", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		const script = `process.stderr.write(" ".repeat(500) + "ERROR"); process.exitCode = 2;`;
+		const drained: string[] = [];
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script], onStderrLine: (l) => drained.push(l) });
+		await new Promise<string>((resolve) => transport.onExit(resolve));
+		expect(drained.join("")).toBe(" ".repeat(500) + "ERROR");
+	});
+
+	it("KILLING (R11): interior whitespace run (500 A + 500 spaces + Z) reassembles to all 1001 chars", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		const script = `process.stderr.write("A".repeat(500) + " ".repeat(500) + "Z" + "\\n"); process.exitCode = 2;`;
+		const drained: string[] = [];
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script], onStderrLine: (l) => drained.push(l) });
+		await new Promise<string>((resolve) => transport.onExit(resolve));
+		expect(drained.join("")).toBe("A".repeat(500) + " ".repeat(500) + "Z");
+	});
+
+	it("(R11 control) a logical line that is ENTIRELY blank is still suppressed", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		const script = `process.stderr.write("   \\n\\nreal line\\n"); process.exitCode = 2;`;
+		const drained: string[] = [];
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script], onStderrLine: (l) => drained.push(l) });
+		await new Promise<string>((resolve) => transport.onExit(resolve));
+		expect(drained).toEqual(["real line"]);
+	});
+
 	it("KILLING (R9): the exit reason is published only after stderr FULLY drains — ~4MB in flight at child death must not lose the final line", async () => {
 		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
 		// 4MB keeps the kernel pipe saturated at death. Under the 'exit'-event mutant this lost

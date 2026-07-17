@@ -68,8 +68,10 @@ export function spawnAppServerTransport(codexBin = "codex", opts?: SpawnTranspor
 	//       event fires once all stdio streams have ended ("exit" can race ahead of late data).
 	const errDecoder = new StringDecoder("utf8");
 	let errBuf = "";
+	// R11: NO blank-suppression here — this receives SEGMENTS, and a whitespace-only segment
+	// can be the middle of a non-blank logical line (e.g. "500 spaces + ERROR"); dropping it
+	// destroys the reassembled diagnostic. Blankness is a LOGICAL-LINE decision (pushSegmented).
 	const pushStderrLine = (line: string) => {
-		if (!line.trim()) return;
 		stderrTail.push(line);
 		if (stderrTail.length > STDERR_TAIL_MAX_LINES) stderrTail.shift();
 		opts?.onStderrLine?.(line);
@@ -81,6 +83,7 @@ export function spawnAppServerTransport(codexBin = "codex", opts?: SpawnTranspor
 	// original character sequence (no truncation — the old code dropped chars 501..\n of a
 	// complete overlong line, and could split an emoji at UTF-16 index 500).
 	function pushSegmented(s: string) {
+		if (!s.trim()) return; // whole LOGICAL LINE blank → suppress; segments below are unconditional
 		let i = 0;
 		while (i < s.length) {
 			let end = Math.min(i + STDERR_LINE_MAX_CHARS, s.length);
@@ -112,7 +115,7 @@ export function spawnAppServerTransport(codexBin = "codex", opts?: SpawnTranspor
 		errBuf += errDecoder.end(); // any trailing partial sequence resolves here
 		const rest = errBuf;
 		errBuf = "";
-		if (rest.trim()) pushSegmented(rest);
+		pushSegmented(rest);
 	};
 	child.stderr?.on("end", flushStderrFragment);
 	child.stderr?.on("close", flushStderrFragment);
