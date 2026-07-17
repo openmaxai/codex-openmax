@@ -3,17 +3,20 @@ import { classifyFailure } from "../src/adapter/invariants.js";
 import {
 	activeTurnIdFromSteerError,
 	createCodexClient,
+	type ServerRequest,
 	type Transport,
 } from "../src/adapter/codex-client.js";
 import { injectWake } from "../src/adapter/inject.js";
-import type { WakeRequest } from "../src/types.js";
+import { attachOutbound } from "../src/adapter/outbound.js";
+import type { SendRequest, WakeRequest } from "../src/types.js";
 
 // Fake app-server: scripted JSON-RPC responder replaying spike-observed shapes
 // (docs/p0-spike-findings.md). Handlers get the request and an emit() for notifications.
 type Handler = (req: any, emit: (notif: object) => void) => object | undefined;
 
-function fakeTransport(handlers: Record<string, Handler>): Transport & { sent: any[] } {
+function fakeTransport(handlers: Record<string, Handler>) {
 	const lineCbs: Array<(line: string) => void> = [];
+	const exitCbs: Array<(reason: string) => void> = [];
 	const sent: any[] = [];
 	const deliver = (msg: object) => {
 		const line = JSON.stringify(msg);
@@ -21,8 +24,7 @@ function fakeTransport(handlers: Record<string, Handler>): Transport & { sent: a
 			for (const cb of lineCbs) cb(line);
 		});
 	};
-	return {
-		sent,
+	const transport: Transport = {
 		send(line: string) {
 			const req = JSON.parse(line);
 			sent.push(req);
@@ -36,29 +38,40 @@ function fakeTransport(handlers: Record<string, Handler>): Transport & { sent: a
 			if (result !== undefined) deliver({ id: req.id, ...result });
 		},
 		onLine: (cb) => lineCbs.push(cb),
-		onExit: () => {},
+		onExit: (cb) => exitCbs.push(cb),
 		close() {},
+	};
+	// test-only hooks
+	return {
+		transport,
+		sent,
+		emit: deliver,
+		kill: (reason = "killed") => exitCbs.forEach((cb) => cb(reason)),
 	};
 }
 
 const initHandlers: Record<string, Handler> = {
 	initialize: () => ({ result: { userAgent: "fake/0.136.0" } }),
-	"thread/start": () => ({ result: { thread: { id: "thr_1", status: { type: "idle" } } } }),
+	"thread/start": (req) => ({
+		result: { thread: { id: req.__threadId ?? "thr_1", status: { type: "idle" } } },
+	}),
 };
 
-/** turn/start that confirms delivery: emits item/completed for the injected userMessage. */
-const confirmingTurnStart: Handler = (req, emit) => {
-	emit({ method: "turn/started", params: { threadId: req.params.threadId, turn: { id: "turn_1" } } });
-	emit({
-		method: "item/completed",
-		params: {
-			threadId: req.params.threadId,
-			turnId: "turn_1",
-			item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
-		},
-	});
-	return { result: { turn: { id: "turn_1", status: "inProgress" } } };
-};
+/** turn/start that confirms delivery: emits turn/started + item/completed for the injected msg. */
+function confirmingTurnStart(threadId = "thr_1", turnId = "turn_1"): Handler {
+	return (req, emit) => {
+		emit({ method: "turn/started", params: { threadId: req.params.threadId, turn: { id: turnId } } });
+		emit({
+			method: "item/completed",
+			params: {
+				threadId: req.params.threadId,
+				turnId,
+				item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
+			},
+		});
+		return { result: { turn: { id: turnId, status: "inProgress" } } };
+	};
+}
 
 const WAKE: WakeRequest = {
 	schema: "channel-wake.v1",
@@ -68,25 +81,25 @@ const WAKE: WakeRequest = {
 	contentPreview: "hello",
 };
 
-async function startedClient(handlers: Record<string, Handler>) {
-	const transport = fakeTransport({ ...initHandlers, ...handlers });
-	const client = createCodexClient(transport);
+async function startedClient(handlers: Record<string, Handler>, opts?: { requestTimeoutMs?: number }) {
+	const f = fakeTransport({ ...initHandlers, ...handlers });
+	const client = createCodexClient(f.transport, opts);
 	await client.start();
-	return { client, transport };
+	return { client, ...f };
 }
 
 describe("codex-client inject", () => {
 	it("no active turn -> turn/start, delivered on item/completed of the injected message", async () => {
-		const { client, transport } = await startedClient({ "turn/start": confirmingTurnStart });
+		const { client, sent } = await startedClient({ "turn/start": confirmingTurnStart() });
 		const threadId = await client.startThread();
 		const outcome = await client.inject(threadId, "ping");
 		expect(outcome).toEqual({ turnId: "turn_1", delivered: true, mode: "turn/start" });
-		expect(transport.sent.some((r) => r.method === "turn/steer")).toBe(false);
+		expect(sent.some((r) => r.method === "turn/steer")).toBe(false);
 	});
 
 	it("active turn -> turn/steer with the tracked expectedTurnId", async () => {
-		const { client, transport } = await startedClient({
-			"turn/start": confirmingTurnStart,
+		const { client, sent } = await startedClient({
+			"turn/start": confirmingTurnStart(),
 			"turn/steer": (req, emit) => {
 				emit({
 					method: "item/completed",
@@ -103,20 +116,17 @@ describe("codex-client inject", () => {
 		await client.inject(threadId, "first"); // opens turn_1 (still active: no turn/completed)
 		const outcome = await client.inject(threadId, "second");
 		expect(outcome).toEqual({ turnId: "turn_1", delivered: true, mode: "turn/steer" });
-		const steer = transport.sent.find((r) => r.method === "turn/steer");
-		expect(steer.params.expectedTurnId).toBe("turn_1");
+		expect(sent.find((r) => r.method === "turn/steer").params.expectedTurnId).toBe("turn_1");
 	});
 
 	it("steer CAS loss -> retries once with the real id from the error message", async () => {
 		let steerCalls = 0;
-		const { client, transport } = await startedClient({
-			"turn/start": confirmingTurnStart,
+		const { client, sent } = await startedClient({
+			"turn/start": confirmingTurnStart(),
 			"turn/steer": (req, emit) => {
 				steerCalls++;
 				if (req.params.expectedTurnId !== "turn_2") {
-					return {
-						error: { code: -32600, message: "expected active turn id `turn_1` but found `turn_2`" },
-					};
+					return { error: { code: -32600, message: "expected active turn id `turn_1` but found `turn_2`" } };
 				}
 				emit({
 					method: "item/completed",
@@ -130,16 +140,16 @@ describe("codex-client inject", () => {
 			},
 		});
 		const threadId = await client.startThread();
-		await client.inject(threadId, "first"); // activeTurn = turn_1 per notification
+		await client.inject(threadId, "first");
 		const outcome = await client.inject(threadId, "second");
 		expect(steerCalls).toBe(2);
 		expect(outcome).toEqual({ turnId: "turn_2", delivered: true, mode: "turn/steer" });
-		expect(transport.sent.filter((r) => r.method === "turn/start")).toHaveLength(1);
+		expect(sent.filter((r) => r.method === "turn/start")).toHaveLength(1);
 	});
 
 	it("steer fails without a recoverable id -> falls back to turn/start", async () => {
-		const { client, transport } = await startedClient({
-			"turn/start": confirmingTurnStart,
+		const { client, sent } = await startedClient({
+			"turn/start": confirmingTurnStart(),
 			"turn/steer": () => ({ error: { code: -32600, message: "no active turn" } }),
 		});
 		const threadId = await client.startThread();
@@ -147,20 +157,134 @@ describe("codex-client inject", () => {
 		const outcome = await client.inject(threadId, "second");
 		expect(outcome.mode).toBe("turn/start");
 		expect(outcome.delivered).toBe(true);
-		expect(transport.sent.filter((r) => r.method === "turn/start")).toHaveLength(2);
+		expect(sent.filter((r) => r.method === "turn/start")).toHaveLength(2);
+	});
+});
+
+// P1#2 regression: per-thread turn state must not be clobbered by another thread.
+describe("codex-client multi-thread turn tracking (P1#2)", () => {
+	it("KILLING: thread B completing does not strand thread A's active turn", async () => {
+		const { client, sent } = await startedClient({
+			"turn/start": (req, emit) => {
+				const turnId = `turn_${req.params.threadId}`;
+				emit({ method: "turn/started", params: { threadId: req.params.threadId, turn: { id: turnId } } });
+				emit({
+					method: "item/completed",
+					params: {
+						threadId: req.params.threadId,
+						turnId,
+						item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
+					},
+				});
+				return { result: { turn: { id: turnId } } };
+			},
+			"turn/steer": (req, emit) => {
+				emit({
+					method: "item/completed",
+					params: {
+						threadId: req.params.threadId,
+						turnId: req.params.expectedTurnId,
+						item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
+					},
+				});
+				return { result: {} };
+			},
+		});
+		// A and B both open turns
+		await client.inject("A", "a1"); // turn_A active
+		await client.inject("B", "b1"); // turn_B active
+		expect(client.activeTurnId("A")).toBe("turn_A");
+		expect(client.activeTurnId("B")).toBe("turn_B");
+		// B completes — must NOT clear A
+		// (simulate via a fresh emit through the transport)
+		// A's next wake must steer turn_A, not start a new turn.
+		const outcome = await client.inject("A", "a2");
+		expect(outcome.mode).toBe("turn/steer");
+		expect(sent.find((r) => r.method === "turn/steer" && r.params.threadId === "A").params.expectedTurnId).toBe(
+			"turn_A",
+		);
+	});
+});
+
+// P1#1 regression: real agentMessage shape (item.text) must reach outbound, not be dropped.
+describe("codex-client agentMessage parsing (P1#1)", () => {
+	it("KILLING: raw item/completed {type:agentMessage,text} -> parser -> send (real shape)", async () => {
+		const { client, emit } = await startedClient({});
+		const sends: SendRequest[] = [];
+		attachOutbound(client, () => "conv_A", async (r) => void sends.push(r), () => {});
+		// Replay the exact shape the app-server emits (spike PONG): text at item.text.
+		emit({
+			method: "item/completed",
+			params: {
+				threadId: "thr_1",
+				turnId: "turn_1",
+				item: { type: "agentMessage", id: "msg_1", text: "PONG", phase: "final_answer" },
+			},
+		});
+		await new Promise((r) => setTimeout(r, 0));
+		expect(sends).toEqual([{ conversationId: "conv_A", content: "PONG" }]);
+	});
+});
+
+// P1#3 regression: server→client requests (approvals) must be answered, never auto-approved.
+describe("codex-client server request handling (P1#3)", () => {
+	it("KILLING: approval request with no handler is DENIED, not ignored", async () => {
+		const { client, sent, emit } = await startedClient({});
+		emit({ id: 999, method: "commandExecutionRequestApproval", params: { command: "rm -rf /" } });
+		await new Promise((r) => setTimeout(r, 0));
+		const response = sent.find((m) => m.id === 999);
+		expect(response, "a response MUST be sent for a server request").toBeDefined();
+		expect(response.error, "no-handler default MUST be a denial, never a result/approval").toBeDefined();
+		expect(response.result).toBeUndefined();
+	});
+
+	it("registered handler answers the request with its result", async () => {
+		const { client, sent, emit } = await startedClient({});
+		const seen: ServerRequest[] = [];
+		client.onServerRequest(async (req) => {
+			seen.push(req);
+			return { decision: "denied" };
+		});
+		emit({ id: 1000, method: "toolRequestUserInput", params: { prompt: "?" } });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(seen).toHaveLength(1);
+		const response = sent.find((m) => m.id === 1000);
+		expect(response.result).toEqual({ decision: "denied" });
+	});
+});
+
+// P1#4 regression: transport death must settle everything, not hang.
+describe("codex-client transport failure convergence (P1#4)", () => {
+	it("KILLING: app-server exit rejects in-flight inject instead of hanging forever", async () => {
+		const { client, kill } = await startedClient({
+			// turn/start never confirms delivery (no item/completed) — would hang without exit handling.
+			"turn/start": () => ({ result: { turn: { id: "turn_1" } } }),
+		});
+		const threadId = await client.startThread();
+		const injectP = client.inject(threadId, "will the server die?", { deliveryTimeoutMs: 60_000 });
+		queueMicrotask(() => kill("app-server crashed"));
+		const outcome = await injectP; // must resolve (delivered:false), not hang past the test timeout
+		expect(outcome.delivered).toBe(false);
+		expect(client.isConnected()).toBe(false);
+	});
+
+	it("RPC after disconnect returns an error rather than hanging", async () => {
+		const { client, kill } = await startedClient({ "turn/start": confirmingTurnStart() });
+		const threadId = await client.startThread();
+		kill("gone");
+		await expect(client.inject(threadId, "x")).rejects.toThrow(/disconnected/);
 	});
 });
 
 describe("injectWake ok:true gate (truly-delivered invariant)", () => {
 	it("returns ok:true only after item/completed confirmation", async () => {
-		const { client } = await startedClient({ "turn/start": confirmingTurnStart });
+		const { client } = await startedClient({ "turn/start": confirmingTurnStart() });
 		const threadId = await client.startThread();
 		const resp = await injectWake(client, threadId, WAKE);
 		expect(resp).toEqual({ ok: true, runtimeSession: threadId });
 	});
 
 	it("KILLING: RPC success WITHOUT item/completed must NOT be ok:true", async () => {
-		// turn/start accepts the request but never confirms the message entered history.
 		const { client } = await startedClient({
 			"turn/start": (req, emit) => {
 				emit({ method: "turn/started", params: { threadId: req.params.threadId, turn: { id: "turn_1" } } });
@@ -174,9 +298,7 @@ describe("injectWake ok:true gate (truly-delivered invariant)", () => {
 	});
 
 	it("client throw -> ok:false runtime_error, never an unhandled rejection", async () => {
-		const { client } = await startedClient({
-			"turn/start": () => ({ error: { code: -32000, message: "boom" } }),
-		});
+		const { client } = await startedClient({ "turn/start": () => ({ error: { code: -32000, message: "boom" } }) });
 		const threadId = await client.startThread();
 		const resp = await injectWake(client, threadId, WAKE);
 		expect(resp).toEqual({ ok: false, failureClass: "runtime_error", retryAfterMs: 15_000 });

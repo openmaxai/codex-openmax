@@ -3,7 +3,8 @@
 // transport = JSONL over stdio child process (`--listen ws` does not exist in 0.136.0);
 // no-turn wake = turn/start; active-turn wake = turn/steer (CAS on expectedTurnId, the
 // error message carries the real active id); delivered-confirmation = item/completed of
-// the injected userMessage (matched via clientUserMessageId).
+// the injected userMessage (matched via clientUserMessageId); agentMessage payload is
+// `item.text` (NOT item.content[]) — see the PONG round-trip in the spike doc.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
@@ -11,13 +12,21 @@ import { randomUUID } from "node:crypto";
 export interface Transport {
 	send(line: string): void;
 	onLine(cb: (line: string) => void): void;
-	onExit(cb: (code: number | null) => void): void;
+	/** Fires on child exit/spawn-error; message is a human-readable cause. */
+	onExit(cb: (reason: string) => void): void;
 	close(): void;
 }
 
 export function spawnAppServerTransport(codexBin = "codex"): Transport {
 	const child = spawn(codexBin, ["app-server"], { stdio: ["pipe", "pipe", "ignore"] });
 	const lineCbs: Array<(line: string) => void> = [];
+	const exitCbs: Array<(reason: string) => void> = [];
+	let ended = false;
+	const fireExit = (reason: string) => {
+		if (ended) return;
+		ended = true;
+		for (const cb of exitCbs) cb(reason);
+	};
 	let buf = "";
 	child.stdout.on("data", (d) => {
 		buf += d.toString();
@@ -28,10 +37,20 @@ export function spawnAppServerTransport(codexBin = "codex"): Transport {
 			if (line.trim()) for (const cb of lineCbs) cb(line);
 		}
 	});
+	// spawn failure (e.g. bad bin → ENOENT) surfaces on the child, not stdin.
+	child.on("error", (err) => fireExit(`spawn error: ${String(err)}`));
+	child.on("exit", (code, signal) => fireExit(`app-server exited (code=${code}, signal=${signal})`));
 	return {
-		send: (line) => child.stdin.write(line + "\n"),
+		send: (line) => {
+			// stdin write after death would throw EPIPE; swallow — onExit already reported.
+			try {
+				child.stdin.write(line + "\n");
+			} catch {
+				/* transport already ended */
+			}
+		},
 		onLine: (cb) => lineCbs.push(cb),
-		onExit: (cb) => child.on("exit", cb),
+		onExit: (cb) => exitCbs.push(cb),
 		close: () => child.kill(),
 	};
 }
@@ -49,6 +68,17 @@ export interface CodexErrorEvent {
 	httpStatusCode?: number;
 }
 
+/**
+ * app-server → client request (id + method + params) requiring a response, e.g. command/file
+ * approval, tool user-input, MCP elicitation/permissions. The handler MUST return a result
+ * object; there is no safe default that auto-approves.
+ */
+export interface ServerRequest {
+	id: number | string;
+	method: string;
+	params: unknown;
+}
+
 export interface InjectOutcome {
 	turnId: string;
 	/** true once the injected userMessage's item/completed arrived (ok:true gate). */
@@ -60,12 +90,13 @@ export interface CodexClient {
 	start(): Promise<void>;
 	stop(): void;
 	startThread(opts?: { cwd?: string; ephemeral?: boolean }): Promise<string>;
-	activeTurnId(): string | null;
+	/** Active turn id for a thread, or null. */
+	activeTurnId(threadId: string): string | null;
 	/**
-	 * Wake path: steer the active turn if one exists, else start a new turn.
+	 * Wake path: steer the thread's active turn if one exists, else start a new turn.
 	 * `delivered` flips true only after the injected message is confirmed in
 	 * model-visible history (item/completed with our clientUserMessageId) —
-	 * the ok:true gate (invariants.ts).
+	 * the ok:true gate (invariants.ts). Rejects if the transport disconnects.
 	 */
 	inject(threadId: string, text: string, opts?: { deliveryTimeoutMs?: number }): Promise<InjectOutcome>;
 	/** Context-only append (no turn started); items are raw Responses API shapes. */
@@ -73,6 +104,14 @@ export interface CodexClient {
 	onAgentMessage(cb: (e: AgentMessageEvent) => void): void;
 	onTurnCompleted(cb: (e: { threadId: string; turnId: string }) => void): void;
 	onError(cb: (e: CodexErrorEvent) => void): void;
+	/**
+	 * Register the handler for app-server→client requests (approvals, tool input…).
+	 * Return a result object to answer; return/throw with no handler set →
+	 * the request is denied (a JSON-RPC error), never silently ignored or auto-approved.
+	 */
+	onServerRequest(handler: (req: ServerRequest) => Promise<object>): void;
+	/** True until the transport disconnects. */
+	isConnected(): boolean;
 }
 
 interface JsonRpcResponse {
@@ -82,6 +121,7 @@ interface JsonRpcResponse {
 }
 
 const DEFAULT_DELIVERY_TIMEOUT_MS = 10_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 /** Parse the real active turn id out of a turn/steer CAS failure message. */
 export function activeTurnIdFromSteerError(message: string): string | null {
@@ -89,20 +129,53 @@ export function activeTurnIdFromSteerError(message: string): string | null {
 	return m ? m[1] : null;
 }
 
-export function createCodexClient(transport: Transport): CodexClient {
+export function createCodexClient(
+	transport: Transport,
+	opts?: { requestTimeoutMs?: number },
+): CodexClient {
+	const requestTimeoutMs = opts?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 	let nextId = 0;
-	const pending = new Map<number, (resp: JsonRpcResponse) => void>();
-	let activeTurn: string | null = null;
-	// clientUserMessageId -> resolve delivered
-	const awaitingDelivery = new Map<string, () => void>();
+	const pending = new Map<number, { resolve: (r: JsonRpcResponse) => void; timer: ReturnType<typeof setTimeout> }>();
+	// P1#2 fix: turn state is per-thread, not a single global scalar.
+	const activeTurns = new Map<string, string>();
+	// clientUserMessageId -> { resolve, timer }
+	const awaitingDelivery = new Map<string, { resolve: (ok: boolean) => void; timer: ReturnType<typeof setTimeout> }>();
 	const agentMessageCbs: Array<(e: AgentMessageEvent) => void> = [];
 	const turnCompletedCbs: Array<(e: { threadId: string; turnId: string }) => void> = [];
 	const errorCbs: Array<(e: CodexErrorEvent) => void> = [];
+	let serverRequestHandler: ((req: ServerRequest) => Promise<object>) | null = null;
+	let connected = true;
 
 	function request(method: string, params: unknown): Promise<JsonRpcResponse> {
+		if (!connected) return Promise.resolve({ id: -1, error: { code: -1, message: "transport disconnected" } });
 		const id = ++nextId;
 		transport.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-		return new Promise((resolve) => pending.set(id, resolve));
+		return new Promise((resolve) => {
+			// P1#4 fix: bound every RPC so a dead app-server can't leave it pending forever.
+			const timer = setTimeout(() => {
+				if (pending.delete(id)) resolve({ id, error: { code: -2, message: `request ${method} timed out` } });
+			}, requestTimeoutMs);
+			pending.set(id, { resolve, timer });
+		});
+	}
+
+	// P1#4 fix: on disconnect, settle every waiter instead of hanging.
+	transport.onExit((reason) => {
+		connected = false;
+		for (const { resolve, timer } of pending.values()) {
+			clearTimeout(timer);
+			resolve({ id: -1, error: { code: -1, message: `transport disconnected: ${reason}` } });
+		}
+		pending.clear();
+		for (const { resolve, timer } of awaitingDelivery.values()) {
+			clearTimeout(timer);
+			resolve(false);
+		}
+		awaitingDelivery.clear();
+	});
+
+	function respond(id: number | string, body: object) {
+		transport.send(JSON.stringify({ jsonrpc: "2.0", id, ...body }));
 	}
 
 	transport.onLine((line) => {
@@ -112,28 +185,55 @@ export function createCodexClient(transport: Transport): CodexClient {
 		} catch {
 			return;
 		}
+		// response to one of our requests
 		if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
-			pending.get(msg.id)?.(msg);
-			pending.delete(msg.id);
+			const entry = pending.get(msg.id);
+			if (entry) {
+				clearTimeout(entry.timer);
+				pending.delete(msg.id);
+				entry.resolve(msg);
+			}
+			return;
+		}
+		// P1#3 fix: app-server → client request (has id AND method) — must be answered.
+		if (msg.id !== undefined && typeof msg.method === "string") {
+			const req: ServerRequest = { id: msg.id, method: msg.method, params: msg.params };
+			if (!serverRequestHandler) {
+				// No handler → deny (never auto-approve, never silently drop).
+				respond(msg.id, {
+					error: { code: -32601, message: `no handler for server request ${msg.method}; denied` },
+				});
+				return;
+			}
+			serverRequestHandler(req)
+				.then((result) => respond(msg.id, { result }))
+				.catch((err) => respond(msg.id, { error: { code: -32000, message: `handler error: ${String(err)}` } }));
 			return;
 		}
 		switch (msg.method) {
-			case "turn/started":
-				activeTurn = msg.params?.turn?.id ?? null;
-				break;
-			case "turn/completed": {
+			case "turn/started": {
+				const tid = msg.params?.threadId;
 				const turnId = msg.params?.turn?.id;
-				if (activeTurn === turnId) activeTurn = null;
-				for (const cb of turnCompletedCbs) cb({ threadId: msg.params?.threadId, turnId });
+				if (tid && turnId) activeTurns.set(tid, turnId);
+				break;
+			}
+			case "turn/completed": {
+				const tid = msg.params?.threadId;
+				const turnId = msg.params?.turn?.id;
+				if (tid && activeTurns.get(tid) === turnId) activeTurns.delete(tid);
+				for (const cb of turnCompletedCbs) cb({ threadId: tid, turnId });
 				break;
 			}
 			case "item/completed": {
 				const item = msg.params?.item;
 				if (item?.type === "userMessage" && item.clientId && awaitingDelivery.has(item.clientId)) {
-					awaitingDelivery.get(item.clientId)!();
+					const entry = awaitingDelivery.get(item.clientId)!;
+					clearTimeout(entry.timer);
 					awaitingDelivery.delete(item.clientId);
+					entry.resolve(true);
 				} else if (item?.type === "agentMessage") {
-					const text = (item.content ?? []).map((c: any) => c?.text ?? "").join("");
+					// P1#1 fix: payload is item.text, not item.content[].
+					const text = typeof item.text === "string" ? item.text : "";
 					for (const cb of agentMessageCbs) {
 						cb({ threadId: msg.params?.threadId, turnId: msg.params?.turnId, text });
 					}
@@ -157,15 +257,13 @@ export function createCodexClient(transport: Transport): CodexClient {
 	});
 
 	function waitDelivered(clientId: string, timeoutMs: number): Promise<boolean> {
+		if (!connected) return Promise.resolve(false);
 		return new Promise((resolve) => {
 			const timer = setTimeout(() => {
 				awaitingDelivery.delete(clientId);
 				resolve(false);
 			}, timeoutMs);
-			awaitingDelivery.set(clientId, () => {
-				clearTimeout(timer);
-				resolve(true);
-			});
+			awaitingDelivery.set(clientId, { resolve, timer });
 		});
 	}
 
@@ -185,8 +283,9 @@ export function createCodexClient(transport: Transport): CodexClient {
 			if (resp.error) throw new Error(`thread/start failed: ${resp.error.message}`);
 			return resp.result.thread.id as string;
 		},
-		activeTurnId: () => activeTurn,
+		activeTurnId: (threadId) => activeTurns.get(threadId) ?? null,
 		async inject(threadId, text, opts) {
+			if (!connected) throw new Error("cannot inject: transport disconnected");
 			const clientUserMessageId = randomUUID();
 			const input = [{ type: "text", text }];
 			const timeoutMs = opts?.deliveryTimeoutMs ?? DEFAULT_DELIVERY_TIMEOUT_MS;
@@ -198,7 +297,7 @@ export function createCodexClient(transport: Transport): CodexClient {
 				return { turnId: resp.result.turn.id, delivered: await deliveredP, mode: "turn/start" };
 			};
 
-			const expected = activeTurn;
+			const expected = activeTurns.get(threadId);
 			if (!expected) return startTurn();
 
 			let resp = await request("turn/steer", { threadId, expectedTurnId: expected, input, clientUserMessageId });
@@ -221,5 +320,9 @@ export function createCodexClient(transport: Transport): CodexClient {
 		onAgentMessage: (cb) => agentMessageCbs.push(cb),
 		onTurnCompleted: (cb) => turnCompletedCbs.push(cb),
 		onError: (cb) => errorCbs.push(cb),
+		onServerRequest: (handler) => {
+			serverRequestHandler = handler;
+		},
+		isConnected: () => connected,
 	};
 }
