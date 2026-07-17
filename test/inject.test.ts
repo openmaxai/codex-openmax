@@ -571,9 +571,12 @@ describe("codex-client concurrent first-wake serialization (runtime-verify P1)",
 // MCP diagnostics were silently discarded. It is now piped, continuously drained, and a bounded
 // tail is attached to the exit reason.
 describe("spawnAppServerTransport stderr retention (runtime-verify P1)", () => {
+	// Fixtures exit via process.exitCode (NOT process.exit()): process.exit() truncates the
+	// child's own unflushed pipe writes, which would test child truncation instead of whether
+	// the ADAPTER waits for the full drain (the thing under test).
 	it("KILLING: child stderr is drained (onStderrLine) and a bounded tail lands in the exit reason", async () => {
 		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
-		const script = `process.stderr.write("ERROR model-cache parse failure\\nERROR MCP startup failed\\n"); process.exit(7);`;
+		const script = `process.stderr.write("ERROR model-cache parse failure\\nERROR MCP startup failed\\n"); process.exitCode = 7;`;
 		const drained: string[] = [];
 		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script], onStderrLine: (l) => drained.push(l) });
 		const reason = await new Promise<string>((resolve) => transport.onExit(resolve));
@@ -584,9 +587,50 @@ describe("spawnAppServerTransport stderr retention (runtime-verify P1)", () => {
 		expect(drained).toEqual(["ERROR model-cache parse failure", "ERROR MCP startup failed"]);
 	});
 
-	it("stderr tail is BOUNDED (last 50 lines, 500 chars each) — a chatty server cannot balloon the exit reason", async () => {
+	it("KILLING (R9): a FATAL diagnostic WITHOUT a trailing newline is flushed exactly once, never lost in errBuf", async () => {
 		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
-		const script = `for (let i = 0; i < 120; i++) process.stderr.write("line-" + i + "-" + "x".repeat(600) + "\\n"); process.exit(1);`;
+		const script = `process.stderr.write("FATAL startup diagnostic without newline"); process.exitCode = 7;`;
+		const drained: string[] = [];
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script], onStderrLine: (l) => drained.push(l) });
+		const reason = await new Promise<string>((resolve) => transport.onExit(resolve));
+		expect(reason).toContain("FATAL startup diagnostic without newline");
+		// exactly ONCE — the end/close double-fire must not flush the fragment twice
+		expect(reason.split("FATAL startup diagnostic without newline")).toHaveLength(2);
+		expect(drained).toEqual(["FATAL startup diagnostic without newline"]);
+	});
+
+	it("KILLING (R9): a single overlong newline-less chunk is ring-chunked with NO char loss/duplication and stays within 50×500", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		// 1800 chars, no newline: 0000000000111... (positional markers every 10 chars)
+		const script = `let s = ""; for (let i = 0; i < 180; i++) s += String(i % 10).repeat(10); process.stderr.write(s); process.exitCode = 3;`;
+		const drained: string[] = [];
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script], onStderrLine: (l) => drained.push(l) });
+		const reason = await new Promise<string>((resolve) => transport.onExit(resolve));
+		let expected = "";
+		for (let i = 0; i < 180; i++) expected += String(i % 10).repeat(10);
+		// no loss, no duplication: the drained chunks re-concatenate to the exact original bytes
+		expect(drained.join("")).toBe(expected);
+		for (const c of drained) expect(c.length).toBeLessThanOrEqual(500);
+		expect(reason.split("\n").slice(1).join("\n")).toBe(drained.join("\n")); // tail = same chunks, bounded
+	});
+
+	it("KILLING (R9): the exit reason is published only after stderr FULLY drains — ~4MB in flight at child death must not lose the final line", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		// 4MB keeps the kernel pipe saturated at death. Under the 'exit'-event mutant this lost
+		// FINAL-MARKER-LINE 5/5 in a standalone-process probe (and R9's broad run reproduced the
+		// race live); NOTE its killing power is scheduling-dependent — under vitest's worker
+		// event loop the mutant can slip through. The by-construction guarantee is 'close'
+		// semantics (fires only after all stdio streams end); this test is the live-shaped canary.
+		const script = `const big = "y".repeat(1024*1024); for (let i = 0; i < 4; i++) process.stderr.write(big + "\\n"); process.stderr.write("FINAL-MARKER-LINE\\n"); process.exitCode = 5;`;
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script] });
+		const reason = await new Promise<string>((resolve) => transport.onExit(resolve));
+		expect(reason).toContain("code=5");
+		expect(reason).toContain("FINAL-MARKER-LINE");
+	});
+
+	it("KILLING (R9): rapid 120-line exit — tail deterministically keeps the LAST 50 lines (exit must not race the drain)", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		const script = `for (let i = 0; i < 120; i++) process.stderr.write("line-" + i + "-" + "x".repeat(600) + "\\n"); process.exitCode = 1;`;
 		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script] });
 		const reason = await new Promise<string>((resolve) => transport.onExit(resolve));
 		expect(reason).not.toContain("line-69-"); // older than the 50-line window (70..119 kept)

@@ -53,21 +53,40 @@ export function spawnAppServerTransport(codexBin = "codex", opts?: SpawnTranspor
 			if (line.trim()) for (const cb of lineCbs) cb(line);
 		}
 	});
+	// R9 P1 fix — three drain guarantees:
+	//   (1) the in-progress fragment is BOUNDED: newline-less output is chunked into the ring
+	//       at STDERR_LINE_MAX_CHARS, so errBuf can never grow past one line-limit;
+	//   (2) the final un-newlined fragment (the classic fatal startup diagnostic) is FLUSHED
+	//       when stderr ends — it must never die in errBuf;
+	//   (3) the exit reason is published only AFTER stderr fully drains: the child "close"
+	//       event fires once all stdio streams have ended ("exit" can race ahead of late data).
 	let errBuf = "";
+	const pushStderrLine = (line: string) => {
+		if (!line.trim()) return;
+		stderrTail.push(line);
+		if (stderrTail.length > STDERR_TAIL_MAX_LINES) stderrTail.shift();
+		opts?.onStderrLine?.(line);
+	};
 	child.stderr?.on("data", (d) => {
 		errBuf += d.toString();
 		let i: number;
 		while ((i = errBuf.indexOf("\n")) >= 0) {
-			const line = errBuf.slice(0, i).slice(0, STDERR_LINE_MAX_CHARS);
+			pushStderrLine(errBuf.slice(0, i).slice(0, STDERR_LINE_MAX_CHARS));
 			errBuf = errBuf.slice(i + 1);
-			if (!line.trim()) continue;
-			stderrTail.push(line);
-			if (stderrTail.length > STDERR_TAIL_MAX_LINES) stderrTail.shift();
-			opts?.onStderrLine?.(line);
+		}
+		while (errBuf.length > STDERR_LINE_MAX_CHARS) {
+			pushStderrLine(errBuf.slice(0, STDERR_LINE_MAX_CHARS));
+			errBuf = errBuf.slice(STDERR_LINE_MAX_CHARS);
 		}
 	});
+	const flushStderrFragment = () => {
+		if (errBuf.trim()) pushStderrLine(errBuf.slice(0, STDERR_LINE_MAX_CHARS));
+		errBuf = "";
+	};
+	child.stderr?.on("end", flushStderrFragment);
+	child.stderr?.on("close", flushStderrFragment);
 	child.on("error", (err) => fireExit(`spawn error: ${String(err)}`));
-	child.on("exit", (code, signal) => fireExit(`app-server exited (code=${code}, signal=${signal})`));
+	child.on("close", (code, signal) => fireExit(`app-server exited (code=${code}, signal=${signal})`));
 	return {
 		send: (line) => {
 			try {
