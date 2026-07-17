@@ -68,18 +68,31 @@ export interface CodexErrorEvent {
 
 // ── Server → client requests (app-server asks the client), per codex 0.136.0 schema.
 // Each method has a method-specific response contract; there is no single generic shape.
-// A registered handler returns the typed result; with no handler we apply a safe
-// NON-INTERACTIVE policy: schema-shaped DENY where a decline exists, else fail closed.
-// It NEVER approves anything.
-export type ServerRequestMethod =
-	| "item/commandExecution/requestApproval"
-	| "item/fileChange/requestApproval"
-	| "execCommandApproval"
-	| "applyPatchApproval"
-	| "item/tool/requestUserInput"
-	| "mcpServer/elicitation/request"
-	| "item/permissions/requestApproval"
-	| "item/tool/call";
+// A registered handler (per-method map) returns that method's EXACT result type — a
+// cross-method result is a compile error and is also rejected at runtime. With no handler
+// for a method we apply a NON-INTERACTIVE policy: schema-shaped DENY where a decline exists,
+// else fail closed. It NEVER approves anything.
+export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
+export type ReviewDecision = "approved" | "approved_for_session" | "denied" | "timed_out" | "abort";
+export type ElicitationAction = "accept" | "decline" | "cancel";
+
+/**
+ * Exhaustive map of every server→client request method (codex 0.136.0 / 0.144.3 schema) to
+ * its response-result type. `never` = no safe non-interactive result exists → must fail closed.
+ */
+export interface ServerRequestResultMap {
+	"item/commandExecution/requestApproval": { decision: ApprovalDecision };
+	"item/fileChange/requestApproval": { decision: ApprovalDecision };
+	execCommandApproval: { decision: ReviewDecision };
+	applyPatchApproval: { decision: ReviewDecision };
+	"item/tool/requestUserInput": { answers: Record<string, unknown> };
+	"mcpServer/elicitation/request": { action: ElicitationAction };
+	"item/permissions/requestApproval": never;
+	"item/tool/call": never;
+	"account/chatgptAuthTokens/refresh": never;
+	"attestation/generate": never;
+}
+export type ServerRequestMethod = keyof ServerRequestResultMap;
 
 export interface ServerRequest<M extends string = string> {
 	id: number | string;
@@ -87,15 +100,38 @@ export interface ServerRequest<M extends string = string> {
 	params: unknown;
 }
 
-// Method → response result type (subset of the schema we can answer non-interactively).
-export type ServerRequestResult =
-	| { decision: "accept" | "acceptForSession" | "decline" | "cancel" } // command/file approval
-	| { decision: "approved" | "approved_for_session" | "denied" | "timed_out" | "abort" } // exec/patch (ReviewDecision)
-	| { answers: Record<string, unknown> } // tool user-input
-	| { action: "accept" | "decline" | "cancel" }; // MCP elicitation
+/**
+ * Per-method handler map: a handler for method M can ONLY return M's exact result type, so a
+ * cross-method result (e.g. a `{decision}` from a user-input handler) fails to compile. Methods
+ * whose result is `never` cannot be answered non-interactively (fail closed by omission).
+ */
+export type ServerRequestHandlers = {
+	[M in ServerRequestMethod]?: (req: ServerRequest<M>) => Promise<ServerRequestResultMap[M]>;
+};
 
-/** Handler answers with a typed result, or throws to fail the request closed. */
-export type ServerRequestHandler = (req: ServerRequest<ServerRequestMethod | string>) => Promise<ServerRequestResult>;
+const APPROVAL_DECISIONS: ReadonlySet<string> = new Set(["accept", "acceptForSession", "decline", "cancel"]);
+const REVIEW_DECISIONS: ReadonlySet<string> = new Set(["approved", "approved_for_session", "denied", "timed_out", "abort"]);
+const ELICITATION_ACTIONS: ReadonlySet<string> = new Set(["accept", "decline", "cancel"]);
+
+/** Runtime guard: does `result` match `method`'s schema? Defends against non-TS/any-cast callers. */
+export function isValidServerResult(method: string, result: unknown): boolean {
+	if (result === null || typeof result !== "object") return false;
+	const r = result as Record<string, unknown>;
+	switch (method) {
+		case "item/commandExecution/requestApproval":
+		case "item/fileChange/requestApproval":
+			return typeof r.decision === "string" && APPROVAL_DECISIONS.has(r.decision);
+		case "execCommandApproval":
+		case "applyPatchApproval":
+			return typeof r.decision === "string" && REVIEW_DECISIONS.has(r.decision);
+		case "item/tool/requestUserInput":
+			return typeof r.answers === "object" && r.answers !== null;
+		case "mcpServer/elicitation/request":
+			return typeof r.action === "string" && ELICITATION_ACTIONS.has(r.action);
+		default:
+			return false; // never-methods have no valid result
+	}
+}
 
 /**
  * Non-interactive default: return a schema-shaped DENY for methods where one exists so the
@@ -120,6 +156,19 @@ export function defaultServerRequestResponse(method: string): { result: object }
 			// no safe non-interactive shape → fail closed, never approve.
 			return { error: { code: -32601, message: `server request ${method} not supported non-interactively; denied` } };
 	}
+}
+
+/**
+ * Classify a turn/steer error: only a schema/runtime-confirmed "no active turn" is safe to
+ * fall back to turn/start (nothing was injected); a CAS mismatch carries the real id to retry;
+ * anything else (internal error, RPC timeout) is TERMINAL — must reject, never start a second
+ * turn (that would double-inject the same wake).
+ */
+export function classifySteerError(err: { code?: number; message: string }): "cas-retry" | "no-active-turn" | "terminal" {
+	const m = err.message || "";
+	if (/but found `[^`]+`/.test(m)) return "cas-retry";
+	if (/no active turn/i.test(m)) return "no-active-turn";
+	return "terminal";
 }
 
 export interface InjectOutcome {
@@ -149,11 +198,13 @@ export interface CodexClient {
 	onTurnCompleted(cb: (e: { threadId: string; turnId: string }) => void): void;
 	onError(cb: (e: CodexErrorEvent) => void): void;
 	/**
-	 * Register the typed handler for app-server→client requests (approvals, tool input…).
-	 * With no handler, the non-interactive default policy applies (DENY / fail closed);
-	 * a request is never silently ignored or auto-approved.
+	 * Register per-method handlers for app-server→client requests (approvals, tool input…).
+	 * Each handler is constrained to its method's exact result type (cross-method returns are a
+	 * compile error and are rejected at runtime). Methods with no registered handler fall back to
+	 * the non-interactive default policy (DENY / fail closed); a request is never silently ignored
+	 * or auto-approved.
 	 */
-	onServerRequest(handler: ServerRequestHandler): void;
+	onServerRequest(handlers: ServerRequestHandlers): void;
 	/** True until the transport disconnects. */
 	isConnected(): boolean;
 	/** Observability (P2): outstanding delivery waiters — asserted 0 after terminal failures. */
@@ -186,7 +237,7 @@ export function createCodexClient(transport: Transport, opts?: { requestTimeoutM
 	const agentMessageCbs: Array<(e: AgentMessageEvent) => void> = [];
 	const turnCompletedCbs: Array<(e: { threadId: string; turnId: string }) => void> = [];
 	const errorCbs: Array<(e: CodexErrorEvent) => void> = [];
-	let serverRequestHandler: ServerRequestHandler | null = null;
+	let serverRequestHandlers: ServerRequestHandlers = {};
 	let connected = true;
 
 	function request(method: string, params: unknown): Promise<JsonRpcResponse> {
@@ -240,13 +291,27 @@ export function createCodexClient(transport: Transport, opts?: { requestTimeoutM
 		}
 		// P1#3 fix: app-server → client request (has id AND method) — must be answered.
 		if (msg.id !== undefined && typeof msg.method === "string") {
-			const req: ServerRequest = { id: msg.id, method: msg.method, params: msg.params };
-			if (!serverRequestHandler) {
-				respond(msg.id, defaultServerRequestResponse(msg.method));
+			const method = msg.method as ServerRequestMethod;
+			const handler = serverRequestHandlers[method] as
+				| ((req: ServerRequest) => Promise<unknown>)
+				| undefined;
+			if (!handler) {
+				// No handler for this method → non-interactive default (schema-shaped DENY / fail closed).
+				respond(msg.id, defaultServerRequestResponse(method));
 				return;
 			}
-			serverRequestHandler(req)
-				.then((result) => respond(msg.id, { result }))
+			handler({ id: msg.id, method, params: msg.params })
+				.then((result) => {
+					// Runtime guard: never forward a shape Codex can't decode, even if a JS/any-cast
+					// caller bypassed the compile-time per-method typing.
+					if (isValidServerResult(method, result)) {
+						respond(msg.id, { result });
+					} else {
+						respond(msg.id, {
+							error: { code: -32603, message: `handler returned invalid result shape for ${method}` },
+						});
+					}
+				})
 				.catch((err) => respond(msg.id, { error: { code: -32000, message: `handler error: ${String(err)}` } }));
 			return;
 		}
@@ -356,10 +421,12 @@ export function createCodexClient(transport: Transport, opts?: { requestTimeoutM
 
 				let resp = await request("turn/steer", { threadId, expectedTurnId: expected, input, clientUserMessageId });
 				if (resp.error) {
-					// CAS lost: the error carries the real active id — retry once with it;
-					// fall back to turn/start when the turn ended meanwhile.
-					const realId = activeTurnIdFromSteerError(resp.error.message);
-					if (realId) {
+					// P1#2 fix: classify the steer error — do NOT blindly fall back to turn/start,
+					// which would double-inject on a terminal/timeout error whose steer may still land.
+					const kind = classifySteerError(resp.error);
+					if (kind === "cas-retry") {
+						const realId = activeTurnIdFromSteerError(resp.error.message);
+						if (!realId) throw new Error(`turn/steer CAS error without a recoverable id: ${resp.error.message}`);
 						resp = await request("turn/steer", { threadId, expectedTurnId: realId, input, clientUserMessageId });
 						if (!resp.error) {
 							// P2#2 fix: write back the recovered id so the next wake steers it and
@@ -367,8 +434,21 @@ export function createCodexClient(transport: Transport, opts?: { requestTimeoutM
 							activeTurns.set(threadId, realId);
 							return { turnId: realId, delivered: await waiter.promise, mode: "turn/steer" };
 						}
+						// second steer failed: only fall back if it now confirms no active turn.
+						if (classifySteerError(resp.error) === "no-active-turn") {
+							activeTurns.delete(threadId);
+							return await startTurn();
+						}
+						throw new Error(`turn/steer retry failed: ${resp.error.message}`);
 					}
-					return await startTurn();
+					if (kind === "no-active-turn") {
+						// Confirmed no active turn: nothing was injected, safe to start fresh (reuse id ok).
+						activeTurns.delete(threadId);
+						return await startTurn();
+					}
+					// Terminal (internal error / RPC timeout): the steer may or may not have landed —
+					// never start a second turn (double-inject risk). Reject; the catch cancels the waiter.
+					throw new Error(`turn/steer failed (terminal, no fallback): ${resp.error.message}`);
 				}
 				return { turnId: expected, delivered: await waiter.promise, mode: "turn/steer" };
 			} catch (err) {
@@ -384,8 +464,8 @@ export function createCodexClient(transport: Transport, opts?: { requestTimeoutM
 		onAgentMessage: (cb) => agentMessageCbs.push(cb),
 		onTurnCompleted: (cb) => turnCompletedCbs.push(cb),
 		onError: (cb) => errorCbs.push(cb),
-		onServerRequest: (handler) => {
-			serverRequestHandler = handler;
+		onServerRequest: (handlers) => {
+			serverRequestHandlers = handlers;
 		},
 		isConnected: () => connected,
 		pendingDeliveryCount: () => awaitingDelivery.size,

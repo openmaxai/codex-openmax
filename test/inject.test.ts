@@ -2,8 +2,10 @@ import { describe, it, expect } from "vitest";
 import { classifyFailure } from "../src/adapter/invariants.js";
 import {
 	activeTurnIdFromSteerError,
+	classifySteerError,
 	createCodexClient,
 	defaultServerRequestResponse,
+	isValidServerResult,
 	type ServerRequest,
 	type Transport,
 } from "../src/adapter/codex-client.js";
@@ -163,47 +165,51 @@ describe("codex-client inject", () => {
 });
 
 // P1#2 regression: per-thread turn state must not be clobbered by another thread.
+// Emits REAL turn/completed so removing the map-cleanup mutation turns this red.
 describe("codex-client multi-thread turn tracking (P1#2)", () => {
-	it("KILLING: thread B completing does not strand thread A's active turn", async () => {
-		const { client, sent } = await startedClient({
-			"turn/start": (req, emit) => {
-				const turnId = `turn_${req.params.threadId}`;
-				emit({ method: "turn/started", params: { threadId: req.params.threadId, turn: { id: turnId } } });
-				emit({
-					method: "item/completed",
-					params: {
-						threadId: req.params.threadId,
-						turnId,
-						item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
-					},
-				});
-				return { result: { turn: { id: turnId } } };
-			},
-			"turn/steer": (req, emit) => {
-				emit({
-					method: "item/completed",
-					params: {
-						threadId: req.params.threadId,
-						turnId: req.params.expectedTurnId,
-						item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
-					},
-				});
-				return { result: {} };
+	const perThreadStart: Handler = (req, emit) => {
+		const turnId = `turn_${req.params.threadId}`;
+		emit({ method: "turn/started", params: { threadId: req.params.threadId, turn: { id: turnId } } });
+		emit({
+			method: "item/completed",
+			params: {
+				threadId: req.params.threadId,
+				turnId,
+				item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
 			},
 		});
-		// A and B both open turns
+		return { result: { turn: { id: turnId } } };
+	};
+	const confirmingSteer: Handler = (req, emit) => {
+		emit({
+			method: "item/completed",
+			params: {
+				threadId: req.params.threadId,
+				turnId: req.params.expectedTurnId,
+				item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
+			},
+		});
+		return { result: {} };
+	};
+
+	it("KILLING: thread B's real completion clears only B; A stays active and its next wake steers turn_A", async () => {
+		const { client, sent, emit } = await startedClient({ "turn/start": perThreadStart, "turn/steer": confirmingSteer });
 		await client.inject("A", "a1"); // turn_A active
 		await client.inject("B", "b1"); // turn_B active
 		expect(client.activeTurnId("A")).toBe("turn_A");
 		expect(client.activeTurnId("B")).toBe("turn_B");
-		// B completes — must NOT clear A
-		// (simulate via a fresh emit through the transport)
+
+		// B's turn REALLY completes — kills the "wrong-thread cleanup" mutation:
+		emit({ method: "turn/completed", params: { threadId: "B", turn: { id: "turn_B" } } });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(client.activeTurnId("B")).toBeNull(); // B cleared
+		expect(client.activeTurnId("A")).toBe("turn_A"); // A untouched
+
 		// A's next wake must steer turn_A, not start a new turn.
 		const outcome = await client.inject("A", "a2");
 		expect(outcome.mode).toBe("turn/steer");
-		expect(sent.find((r) => r.method === "turn/steer" && r.params.threadId === "A").params.expectedTurnId).toBe(
-			"turn_A",
-		);
+		const aSteer = sent.filter((r) => r.method === "turn/steer" && r.params.threadId === "A").at(-1);
+		expect(aSteer.params.expectedTurnId).toBe("turn_A");
 	});
 });
 
@@ -276,18 +282,44 @@ describe("codex-client server request handling (P1#3)", () => {
 		expect("error" in defaultServerRequestResponse("totally/unknown/method")).toBe(true);
 	});
 
-	it("registered typed handler answers with its result", async () => {
+	it("registered per-method handler answers with its typed result", async () => {
 		const { client, sent, emit } = await startedClient({});
 		const seen: ServerRequest[] = [];
-		client.onServerRequest(async (req) => {
-			seen.push(req);
-			return { decision: "decline" };
+		client.onServerRequest({
+			"item/commandExecution/requestApproval": async (req) => {
+				seen.push(req);
+				return { decision: "decline" };
+			},
 		});
 		emit({ id: 1000, method: "item/commandExecution/requestApproval", params: { command: "ls" } });
 		await new Promise((r) => setTimeout(r, 0));
 		expect(seen).toHaveLength(1);
 		expect(seen[0].method).toBe("item/commandExecution/requestApproval");
 		expect(sent.find((m) => m.id === 1000).result).toEqual({ decision: "decline" });
+	});
+
+	it("KILLING: a handler that returns a cross-method (invalid) shape is rejected, not forwarded", async () => {
+		const { client, sent, emit } = await startedClient({});
+		// Simulate a JS/any-cast caller bypassing the compile-time per-method typing:
+		client.onServerRequest({
+			// user-input MUST return {answers}; returning a command {decision} is illegal
+			"item/tool/requestUserInput": (async () => ({ decision: "decline" })) as never,
+		});
+		emit({ id: 1001, method: "item/tool/requestUserInput", params: {} });
+		await new Promise((r) => setTimeout(r, 0));
+		const resp = sent.find((m) => m.id === 1001);
+		expect(resp.error, "invalid cross-method result must be rejected at runtime").toBeDefined();
+		expect(resp.result).toBeUndefined();
+	});
+
+	it("isValidServerResult enforces each method's schema (unit)", () => {
+		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: "decline" })).toBe(true);
+		expect(isValidServerResult("item/commandExecution/requestApproval", { decision: "approved" })).toBe(false); // wrong enum
+		expect(isValidServerResult("item/tool/requestUserInput", { answers: {} })).toBe(true);
+		expect(isValidServerResult("item/tool/requestUserInput", { decision: "decline" })).toBe(false); // cross-method
+		expect(isValidServerResult("execCommandApproval", { decision: "denied" })).toBe(true);
+		expect(isValidServerResult("mcpServer/elicitation/request", { action: "decline" })).toBe(true);
+		expect(isValidServerResult("item/permissions/requestApproval", { permissions: {} })).toBe(false); // never
 	});
 });
 
@@ -318,7 +350,7 @@ describe("codex-client transport failure convergence (P1#4)", () => {
 describe("codex-client CAS recovery state convergence (P2#2)", () => {
 	it("KILLING: after steer CAS recovery, state = realId; next wake steers realId (no repeat CAS) and completion clears it", async () => {
 		let firstStale = true;
-		const { client, sent } = await startedClient({
+		const { client, sent, emit } = await startedClient({
 			"turn/start": confirmingTurnStart("T", "turn_1"),
 			"turn/steer": (req, emit) => {
 				// Only turn_2 is the real active id; the tracked turn_1 loses CAS once.
@@ -347,9 +379,54 @@ describe("codex-client CAS recovery state convergence (P2#2)", () => {
 		expect(outcome).toEqual({ turnId: "turn_2", delivered: true, mode: "turn/steer" });
 		const thirdSteer = sent.filter((r) => r.method === "turn/steer").slice(beforeSteers);
 		expect(thirdSteer.every((r) => r.params.expectedTurnId === "turn_2")).toBe(true);
-		// real completion of turn_2 clears the map (was impossible when state stayed turn_1)
-		// emit turn/completed for turn_2 via a steer handler is awkward; assert current state instead:
-		expect(client.activeTurnId("T")).toBe("turn_2");
+		// REAL completion of the recovered turn_2 must clear the map — kills the cleanup mutation
+		// (impossible when state wrongly stayed turn_1).
+		emit({ method: "turn/completed", params: { threadId: "T", turn: { id: "turn_2" } } });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(client.activeTurnId("T")).toBeNull();
+		// after completion, the next wake starts a fresh turn (no stale steer)
+		const outcome2 = await client.inject("T", "fourth");
+		expect(outcome2.mode).toBe("turn/start");
+	});
+});
+
+// P1#2 (steer error classification): only a confirmed "no active turn" may fall back to
+// turn/start; a terminal/internal error must reject (never double-inject via a second turn).
+describe("codex-client steer error classification (P1#2)", () => {
+	it("classifySteerError distinguishes cas-retry / no-active-turn / terminal (unit)", () => {
+		expect(classifySteerError({ message: "expected active turn id `a` but found `b`" })).toBe("cas-retry");
+		expect(classifySteerError({ message: "no active turn to steer" })).toBe("no-active-turn");
+		expect(classifySteerError({ code: -32000, message: "internal error" })).toBe("terminal");
+		expect(classifySteerError({ code: -2, message: "request turn/steer timed out" })).toBe("terminal");
+	});
+
+	it("KILLING: terminal steer error rejects and does NOT start a second turn (no double-inject)", async () => {
+		let opened = false;
+		const { client, sent } = await startedClient({
+			"turn/start": (req, emit) => {
+				if (!opened) {
+					opened = true;
+					emit({ method: "turn/started", params: { threadId: req.params.threadId, turn: { id: "turn_1" } } });
+					emit({
+						method: "item/completed",
+						params: {
+							threadId: req.params.threadId,
+							turnId: "turn_1",
+							item: { type: "userMessage", clientId: req.params.clientUserMessageId, content: [] },
+						},
+					});
+					return { result: { turn: { id: "turn_1" } } };
+				}
+				return { result: { turn: { id: "turn_2" } } }; // would be the erroneous 2nd turn
+			},
+			"turn/steer": () => ({ error: { code: -32000, message: "internal boom" } }), // terminal, not "no active turn"
+		});
+		await client.inject("T", "first"); // opens turn_1
+		const startsBefore = sent.filter((r) => r.method === "turn/start").length;
+		await expect(client.inject("T", "second")).rejects.toThrow(/terminal, no fallback/);
+		const startsAfter = sent.filter((r) => r.method === "turn/start").length;
+		expect(startsAfter).toBe(startsBefore); // NO second turn/start — no double injection
+		expect(client.pendingDeliveryCount()).toBe(0);
 	});
 });
 
