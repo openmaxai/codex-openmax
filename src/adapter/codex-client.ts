@@ -7,6 +7,7 @@
 // `item.text` (NOT item.content[]) — see the PONG round-trip in the spike doc.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 
 /** Line-oriented JSON-RPC transport; real = child process stdio, tests = fake. */
 export interface Transport {
@@ -43,9 +44,14 @@ export function spawnAppServerTransport(codexBin = "codex", opts?: SpawnTranspor
 		ended = true;
 		for (const cb of exitCbs) cb(withTail(reason));
 	};
+	// StringDecoder on BOTH stdio paths: a multi-byte UTF-8 character can be split across
+	// pipe chunks, and Buffer#toString on a partial sequence injects U+FFFD — on stdout that
+	// corrupts a JSON-RPC line carrying CJK/emoji content (parse failure → dropped message),
+	// on stderr it corrupts diagnostics. The decoder carries the partial sequence across chunks.
+	const outDecoder = new StringDecoder("utf8");
 	let buf = "";
 	child.stdout.on("data", (d) => {
-		buf += d.toString();
+		buf += outDecoder.write(d);
 		let i: number;
 		while ((i = buf.indexOf("\n")) >= 0) {
 			const line = buf.slice(0, i);
@@ -60,6 +66,7 @@ export function spawnAppServerTransport(codexBin = "codex", opts?: SpawnTranspor
 	//       when stderr ends — it must never die in errBuf;
 	//   (3) the exit reason is published only AFTER stderr fully drains: the child "close"
 	//       event fires once all stdio streams have ended ("exit" can race ahead of late data).
+	const errDecoder = new StringDecoder("utf8");
 	let errBuf = "";
 	const pushStderrLine = (line: string) => {
 		if (!line.trim()) return;
@@ -68,7 +75,7 @@ export function spawnAppServerTransport(codexBin = "codex", opts?: SpawnTranspor
 		opts?.onStderrLine?.(line);
 	};
 	child.stderr?.on("data", (d) => {
-		errBuf += d.toString();
+		errBuf += errDecoder.write(d);
 		let i: number;
 		while ((i = errBuf.indexOf("\n")) >= 0) {
 			pushStderrLine(errBuf.slice(0, i).slice(0, STDERR_LINE_MAX_CHARS));
@@ -80,6 +87,7 @@ export function spawnAppServerTransport(codexBin = "codex", opts?: SpawnTranspor
 		}
 	});
 	const flushStderrFragment = () => {
+		errBuf += errDecoder.end(); // any trailing partial sequence resolves here
 		if (errBuf.trim()) pushStderrLine(errBuf.slice(0, STDERR_LINE_MAX_CHARS));
 		errBuf = "";
 	};

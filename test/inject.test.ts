@@ -628,6 +628,20 @@ describe("spawnAppServerTransport stderr retention (runtime-verify P1)", () => {
 		expect(reason).toContain("FINAL-MARKER-LINE");
 	});
 
+	it("KILLING: multi-byte UTF-8 split across pipe chunks must not corrupt (200KB of CJK — 64KB chunk boundaries always land mid-character)", async () => {
+		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
+		// 好 is 3 UTF-8 bytes; the 64KB pipe chunk size is not divisible by 3, so chunk
+		// boundaries are GUARANTEED to split characters. Naive Buffer#toString injects U+FFFD.
+		const script = `process.stderr.write("好".repeat(66666) + "\\n"); process.exitCode = 0;`;
+		const drained: string[] = [];
+		const transport = spawnAppServerTransport(process.execPath, { args: ["-e", script], onStderrLine: (l) => drained.push(l) });
+		await new Promise<string>((resolve) => transport.onExit(resolve));
+		const joined = drained.join("");
+		expect(joined).not.toContain("�"); // no replacement chars anywhere
+		expect(joined).toBe("好".repeat(66666).slice(0, joined.length)); // pure 好 prefix (ring keeps the head chunks it saw)
+		expect(joined.length).toBeGreaterThan(0);
+	});
+
 	it("KILLING (R9): rapid 120-line exit — tail deterministically keeps the LAST 50 lines (exit must not race the drain)", async () => {
 		const { spawnAppServerTransport } = await import("../src/adapter/codex-client.js");
 		const script = `for (let i = 0; i < 120; i++) process.stderr.write("line-" + i + "-" + "x".repeat(600) + "\\n"); process.exitCode = 1;`;
