@@ -1,5 +1,5 @@
 {
   "cws":    { "bffUrl": "https://openmax.com", "wsUrl": "wss://openmax.com/ws", "identityId": "", "apiKey": "" },
-  "codex":  { "appServerWsUrl": "ws://127.0.0.1:1456", "mode": "app-server" },
+  "codex":  { "bin": "codex", "cwd": "." },
   "bridge": { "localHttpPort": 8787 }
 }

@@ -27,22 +27,39 @@ CWS Server ⟷ WebSocket ⟷ [ Layer 1 Bridge (@openmaxai/cws-agent-sdk) ]
 
 ## Integration target: Codex CLI (not desktop/IDE)
 
-The OpenAI Codex **CLI** is the only surface exposing a stable programmatic injection interface: `codex app-server` (JSON-RPC, stdio or `--listen ws://…`), `codex mcp-server` (`codex()` / `codex-reply(threadId)`), `turn.steer`. Desktop/IDE extensions lack this, so they are out of scope for Layer 2's wake→inject. Exact protocol details are pinned in P0 against the current Codex CLI version.
+The OpenAI Codex **CLI** is the only surface exposing a stable programmatic injection interface: `codex app-server` (JSON-RPC over **stdio** — there is no `--listen ws` in 0.136.0), with `turn/start` / `turn/steer` / `thread/inject_items`. Desktop/IDE extensions lack this, so they are out of scope for Layer 2's wake→inject. Exact protocol shapes are pinned in `p0-spike-findings.md` against the current Codex CLI version.
 
-## Three design decisions (resolve in P0, before implementation)
+## Three design decisions (RESOLVED in P0 — see `p0-spike-findings.md`)
 
-1. **Injection model** — `turn.steer` (into a running turn) vs `codex-reply(threadId)` (external) vs `app-server --listen ws` as the carrier. Leaning: ws JSON-RPC carrier + `turn.steer`, `codex-reply` as fallback.
-2. **No active turn** — how a wake is handled when no turn is running (start a new turn? queue?). Codex-specific gap.
-3. **`ok:true` = truly delivered** — how to verify injection actually reached Codex's visible context.
+1. **Injection model** — DECIDED: spawn `codex app-server` as a stdio child; active turn → `turn/steer` (CAS on `expectedTurnId`; the error carries the real id → retry once, else fall back); no active turn → `turn/start`; context-only append → `thread/inject_items`. The `codex mcp-server` `codex-reply` fallback is **not needed**.
+2. **No active turn** — DECIDED: `turn/start` on the same app-server connection (a bare `turn/steer` with no active turn errors `no active turn to steer`).
+3. **`ok:true` = truly delivered** — DECIDED: gate on the injected `userMessage`'s `item/completed` (matched by `clientUserMessageId`); RPC-accepted-but-unconfirmed ⇒ `inject_failed`, never `ok:true`.
 
 ## Phases
 
 | Phase | Content | Output |
 |---|---|---|
-| **P0 Spike** | run `codex app-server --listen ws`, prove "external JSON-RPC injects a message → Codex sees it and replies" | injection model decided + no-turn conclusion |
-| **P1 MVP** | repo init → SDK v0 wiring → Inbound (/wake→inject) → Outbound (output→/send) → basic round-trip test | bidirectional connectivity, contract aligned |
+| **P0 Spike** ✅ | spawn `codex app-server` (stdio JSON-RPC), prove "external JSON-RPC injects a message → Codex sees it and replies" (live PONG done) | injection model decided + no-turn conclusion |
+| **P1 MVP** 🚧 | repo init ✅ → codex-client + inject + outbound ✅ → SDK v0 wiring → local HTTP /wake /send → bidirectional round-trip test | bidirectional connectivity, contract aligned |
 | **P2 Hardening** | ok:true invariant + verification; failureClass + backoff; no-turn/backpressure/concurrent wakes; outbound streaming | contract invariants + edge cases |
 | **P3 Integration** | Workspace scheduling adapter; live end-to-end; regression tests | end-to-end green |
+
+## Deferred to P2 Hardening (owner decision A — merge-now-harden-later, 2026-07-17)
+
+- **Full-fidelity server-request contract** (from PR #1 R5/R6 review): the answerable methods' RESULT
+  types + runtime validator are now schema-exact — command approval vs file-change decisions are
+  distinct (file-change is strings only, no structured variants), the command/exec-review structured
+  amendment variants use the exact inner shapes (`ExecPolicyAmendment = string[]`,
+  `NetworkPolicyAmendment = {host, action∈{allow,deny}}`) with required/enum/no-extra + deep
+  JsonValue validation, and the four no-safe-default methods fail closed. Validation runs on the
+  canonicalized WIRE form (from R7): the response envelope is serialized once, the re-parsed result
+  is what the guard checks, and the exact validated bytes are what get sent — so sparse-array
+  holes, inherited required props, and toJSON/getter drift cannot pass the guard yet emit
+  schema-invalid bytes. Still deferred to P2 (owner
+  decision A): derive/import the pinned official generated bindings wholesale and model all 10
+  methods' `params` exactly + generate conformance fixtures from the same authoritative schema.
+  Until a handler is registered the safe default-deny policy runs (no runtime exposure), which is why
+  the remaining binding/params/fixtures work is P2, not a P1 merge gate.
 
 ## Open items (from review of the proposal)
 
