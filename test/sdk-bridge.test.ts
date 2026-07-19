@@ -45,8 +45,9 @@ describe("sdk-bridge: InboundMessage → WakeRequest mapping", () => {
 		});
 	});
 
-	it("unresolved sender (senderId absent per inbound-message.schema.json) maps to \"\" — still schema-valid on the wire", () => {
-		expect(toWakeRequest(msg({ senderId: undefined })).senderId).toBe("");
+	it("unresolved sender (senderId absent per inbound-message.schema.json) is OMITTED on the wire — sender-less wake is legal (SDK fixture 04)", () => {
+		const wake = toWakeRequest(msg({ senderId: undefined }));
+		expect("senderId" in wake).toBe(false);
 	});
 
 	it("contentPreview is capped (short, non-authoritative per the schema)", () => {
@@ -60,9 +61,9 @@ describe("sdk-bridge: InboundMessage → WakeRequest mapping", () => {
 describe("sdk-bridge: deliver() result fidelity (wake-result invariant)", () => {
 	it("KILLING: deliver resolves with the handler's WakeResponse VERBATIM — ok:false is never upgraded", async () => {
 		const { bridge, deliver } = harness();
-		bridge.onInbound(async () => ({ ok: false, failureClass: "inject_failed", retryAfterMs: 5000 }));
+		bridge.onInbound(async () => ({ ok: false, failureClass: "wake_failed", retryAfterMs: 5000 }));
 		const res = await deliver(msg());
-		expect(res).toEqual({ ok: false, failureClass: "inject_failed", retryAfterMs: 5000 });
+		expect(res).toEqual({ ok: false, failureClass: "wake_failed", retryAfterMs: 5000 });
 	});
 
 	it("KILLING: no inbound handler wired → typed retryable failure, NEVER ok (a fabricated ok commits SDK markers and loses the message)", async () => {
@@ -78,7 +79,7 @@ describe("sdk-bridge: deliver() result fidelity (wake-result invariant)", () => 
 			throw new Error("wake path exploded");
 		});
 		const res = await deliver(msg());
-		expect(res).toEqual({ ok: false, failureClass: "runtime_error", retryAfterMs: 15_000 });
+		expect(res).toEqual({ ok: false, failureClass: "wake_failed", retryAfterMs: 15_000 });
 	});
 
 	it("ok:true passes through with the runtime session", async () => {

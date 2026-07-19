@@ -61,7 +61,7 @@ function routingFetch(routes: Route[]) {
 }
 
 /** Build my CwsBridge on a REAL CwsAgentBridge wired to the fixture's org + fetch routes. */
-async function startRealBridge(fx: { org: { slug: string }; frame: { payload: { conversation_id: string; id: string } }; detail: unknown; conversation: unknown }, extraRoutes: Route[] = []) {
+async function startRealBridge(fx: { org: { org_id: string }; frame: { payload: { conversation_id: string; id: string } }; detail: unknown; conversation: unknown }, extraRoutes: Route[] = []) {
 	const conv = fx.frame.payload.conversation_id;
 	const msgId = fx.frame.payload.id;
 	const http = new CwsHttpClient({
@@ -88,10 +88,10 @@ async function startRealBridge(fx: { org: { slug: string }; frame: { payload: { 
 		return sdk;
 	});
 	await bridge.start();
-	return { bridge, sdk: sdk!, inject: () => sdk!.injectFrame(fx.org.slug, fx.frame) };
+	return { bridge, sdk: sdk!, inject: () => sdk!.injectFrame(fx.org.org_id, fx.frame) };
 }
 
-describe("REAL-SDK integration (CwsAgentBridge @0.1.0-alpha.0 → sdk-bridge → wake contract)", () => {
+describe("REAL-SDK integration (CwsAgentBridge @0.1.0-alpha.2 → sdk-bridge → wake contract)", () => {
 	it("a DM frame through the REAL inbound pipeline reaches the wake handler as a contract-exact WakeRequest", async () => {
 		process.env.COCO_RPC_LOG = "0";
 		const fx = readJson(`${FIXTURES}/01-dm-open-basic.json`);
@@ -109,7 +109,7 @@ describe("REAL-SDK integration (CwsAgentBridge @0.1.0-alpha.0 → sdk-bridge →
 		await bridge.stop();
 	});
 
-	it("KILLING: an UNRESOLVED sender from the real pipeline maps to senderId \"\" (wake-request requires the field)", async () => {
+	it("KILLING: an UNRESOLVED sender from the real pipeline OMITS senderId (sender-less wake is legal per SDK v1)", async () => {
 		const fx = readJson(`${FIXTURES}/05-dm-sender-unresolved.json`);
 		const wakes: WakeRequest[] = [];
 		const { bridge, inject } = await startRealBridge(fx);
@@ -120,7 +120,7 @@ describe("REAL-SDK integration (CwsAgentBridge @0.1.0-alpha.0 → sdk-bridge →
 		inject();
 		await flush();
 		expect(wakes).toHaveLength(1);
-		expect(wakes[0].senderId).toBe(""); // absent on InboundMessage → "" on the wire (still schema-valid)
+		expect("senderId" in wakes[0]).toBe(false); // absent on InboundMessage → absent on the wire (fixture 04-sender-less)
 		await bridge.stop();
 	});
 
@@ -181,11 +181,11 @@ describe("REAL-SDK integration (CwsAgentBridge @0.1.0-alpha.0 → sdk-bridge →
 			});
 			return sdk;
 		});
-		bridge.onInbound(async () => ({ ok: false, failureClass: "runtime_busy", retryAfterMs: 2000 }) as WakeResponse);
+		bridge.onInbound(async () => ({ ok: false, failureClass: "wake_failed", retryAfterMs: 2000 }) as WakeResponse);
 		await bridge.start();
-		sdk!.injectFrame(fx.org.slug, fx.frame);
+		sdk!.injectFrame(fx.org.org_id, fx.frame);
 		await flush();
-		expect(deliverResults).toEqual([{ ok: false, failureClass: "runtime_busy", retryAfterMs: 2000 }]);
+		expect(deliverResults).toEqual([{ ok: false, failureClass: "wake_failed", retryAfterMs: 2000 }]);
 		await bridge.stop();
 	});
 });

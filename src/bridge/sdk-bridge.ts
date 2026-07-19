@@ -54,9 +54,9 @@ export function toWakeRequest(msg: SdkInboundMessage): WakeRequest {
 		schema: WAKE_SCHEMA,
 		messageId: String(msg.messageId),
 		conversationId: String(msg.conversationId),
-		// senderId is REQUIRED (string) on the wire but optional on InboundMessage —
-		// an unresolved sender maps to "" (schema-valid; the runtime treats it as unknown).
-		senderId: msg.senderId == null ? "" : String(msg.senderId),
+		// senderId is OPTIONAL on the wire (sender-less inbound is legal per
+		// wake-request.schema.json) — mirror InboundMessage: omit when unresolved.
+		...(msg.senderId == null ? {} : { senderId: String(msg.senderId) }),
 		contentPreview: text.length > PREVIEW_MAX ? text.slice(0, PREVIEW_MAX) : text,
 	};
 }
@@ -75,14 +75,14 @@ export function createSdkCwsBridge(makeBridge: (deliver: SdkInboundDeliver) => S
 		routes.set(msg.conversationId, { endpoint, orgId: msg.orgId });
 		if (!handler) {
 			// No runtime wired yet: fail typed (SDK holds its markers and redelivers) — never ok.
-			return { ok: false, failureClass: "runtime_error", retryAfterMs: 15_000 };
+			return { ok: false, failureClass: "wake_failed", retryAfterMs: 15_000 };
 		}
 		try {
 			return await handler(toWakeRequest(msg));
 		} catch {
 			// A throwing handler must not bubble into the SDK as an unclassified rejection here;
 			// deliver() resolving ok:false keeps the retry semantics identical.
-			return { ok: false, failureClass: "runtime_error", retryAfterMs: 15_000 };
+			return { ok: false, failureClass: "wake_failed", retryAfterMs: 15_000 };
 		}
 	};
 

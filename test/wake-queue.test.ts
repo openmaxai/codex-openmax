@@ -80,7 +80,7 @@ describe("wake queue (P1 backpressure + concurrency)", () => {
 		const q = createWakeQueue(p.process);
 		const r1 = q.enqueue(wake("m1"));
 		await tick();
-		p.settlers[0]({ ok: false, failureClass: "inject_failed", retryAfterMs: 5000 });
+		p.settlers[0]({ ok: false, failureClass: "wake_failed", retryAfterMs: 5000 });
 		expect((await r1).ok).toBe(false);
 		const r2 = q.enqueue(wake("m1")); // upstream retry
 		await tick();
@@ -89,13 +89,13 @@ describe("wake queue (P1 backpressure + concurrency)", () => {
 		expect((await r2).ok).toBe(true);
 	});
 
-	it("KILLING: backpressure — beyond maxQueuedPerConversation answers runtime_busy+retryAfterMs and never injects; capacity frees after drain", async () => {
+	it("KILLING: backpressure — beyond maxQueuedPerConversation sheds wake_failed+retryAfterMs (internal: runtime_busy) and never injects; capacity frees after drain", async () => {
 		const p = controlledProcessor();
 		const q = createWakeQueue(p.process, { maxQueuedPerConversation: 2 });
 		const r1 = q.enqueue(wake("m1"));
 		const r2 = q.enqueue(wake("m2"));
 		const shed = await q.enqueue(wake("m3")); // over cap → shed immediately
-		expect(shed).toEqual({ ok: false, failureClass: "runtime_busy", retryAfterMs: 2000 });
+		expect(shed).toEqual({ ok: false, failureClass: "wake_failed", retryAfterMs: 2000 });
 		await tick();
 		expect(p.calls).toEqual(["m1"]); // m3 never reached the processor
 		p.settlers[0](OK);
@@ -119,20 +119,20 @@ describe("wake queue (P1 backpressure + concurrency)", () => {
 		await tick();
 		p.rejecters[0](new Error("thread/start failed: kaboom"));
 		const res1 = await r1;
-		expect(res1).toEqual({ ok: false, failureClass: "runtime_error", retryAfterMs: 15_000 });
+		expect(res1).toEqual({ ok: false, failureClass: "wake_failed", retryAfterMs: 15_000 });
 		await tick();
 		expect(p.calls).toEqual(["m1", "m2"]); // m2 still ran after m1's throw
 		p.settlers[1](OK);
 		expect((await r2).ok).toBe(true);
 	});
 
-	it("a 401-throwing processor maps to TERMINAL runtime_error (no retryAfterMs — upstream must not loop on a bad key)", async () => {
+	it("a 401-throwing processor maps to TERMINAL wake_failed with NO retryAfterMs (upstream must not loop on a bad key)", async () => {
 		const p = controlledProcessor();
 		const q = createWakeQueue(p.process);
 		const r1 = q.enqueue(wake("m1"));
 		await tick();
 		p.rejecters[0](new Error("401 Unauthorized"));
-		expect(await r1).toEqual({ ok: false, failureClass: "runtime_error" }); // exactly: no retryAfterMs key
+		expect(await r1).toEqual({ ok: false, failureClass: "wake_failed" }); // exactly: no retryAfterMs key
 	});
 
 	it("delivered-LRU evicts oldest at capacity — an evicted id re-injects instead of answering stale-idempotent", async () => {

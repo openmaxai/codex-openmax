@@ -72,9 +72,11 @@ export function createWakeQueue(
 			const cid = wake.conversationId;
 			const depth = depths.get(cid) ?? 0;
 			if (depth >= maxQueued) {
+				// Internal diagnosis: runtime_busy. Wire failureClass is canonical (enum) —
+				// the class-specific backoff hint is how the distinction survives on the wire.
 				return Promise.resolve<WakeResponse>({
 					ok: false,
-					failureClass: "runtime_busy",
+					failureClass: "wake_failed",
 					retryAfterMs: retryAfterMs("runtime_busy"),
 				});
 			}
@@ -86,9 +88,11 @@ export function createWakeQueue(
 				// Contain a throwing processor as a typed failure so the FIFO chain never breaks
 				// (a rejected tail would wedge every later wake in the conversation).
 				.catch((err): WakeResponse => {
-					if (isAuthTerminal(err)) return { ok: false, failureClass: "runtime_error" };
-					const failureClass = classifyFailure(err);
-					return { ok: false, failureClass, retryAfterMs: retryAfterMs(failureClass) };
+					// Terminal (auth): no retryAfterMs hint — v1 can't express terminal-no-retry
+					// (contract-revision proposal pending); omitting the hint is the closest signal.
+					if (isAuthTerminal(err)) return { ok: false, failureClass: "wake_failed" };
+					const diagnosed = classifyFailure(err);
+					return { ok: false, failureClass: "wake_failed", retryAfterMs: retryAfterMs(diagnosed) };
 				})
 				.then((res) => {
 					inFlight.delete(wake.messageId);

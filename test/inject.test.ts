@@ -966,14 +966,14 @@ describe("injectWake ok:true gate (truly-delivered invariant)", () => {
 		const threadId = await client.startThread();
 		const resp = await injectWake(client, threadId, WAKE, { deliveryTimeoutMs: 50 });
 		expect(resp.ok).toBe(false);
-		if (!resp.ok) expect(resp.failureClass).toBe("inject_failed");
+		if (!resp.ok) expect(resp.failureClass).toBe("wake_failed");
 	});
 
-	it("client throw -> ok:false runtime_error, never an unhandled rejection", async () => {
+	it("client throw -> ok:false wake_failed (internal: runtime_error), never an unhandled rejection", async () => {
 		const { client } = await startedClient({ "turn/start": () => ({ error: { code: -32000, message: "boom" } }) });
 		const threadId = await client.startThread();
 		const resp = await injectWake(client, threadId, WAKE);
-		expect(resp).toEqual({ ok: false, failureClass: "runtime_error", retryAfterMs: 15_000 });
+		expect(resp).toEqual({ ok: false, failureClass: "wake_failed", retryAfterMs: 15_000 });
 	});
 });
 

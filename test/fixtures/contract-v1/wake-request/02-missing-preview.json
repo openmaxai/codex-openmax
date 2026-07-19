@@ -1,5 +1,5 @@
 {
-  "description": "Missing contentPreview is rejected (all five fields are required).",
+  "description": "Missing contentPreview is rejected (contentPreview is required; senderId is not).",
   "input": {
     "schema": "raft-channel-wake.v1",
     "messageId": "m1",

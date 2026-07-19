@@ -41,17 +41,20 @@ function readJsonBody(req: IncomingMessage, limitBytes = 1_000_000): Promise<unk
 	});
 }
 
-const WAKE_FIELDS = ["schema", "messageId", "conversationId", "senderId", "contentPreview"] as const;
+const WAKE_REQUIRED_FIELDS = ["schema", "messageId", "conversationId", "contentPreview"] as const;
+const WAKE_ALLOWED_FIELDS = [...WAKE_REQUIRED_FIELDS, "senderId"] as const;
 
-/** Schema-exact guard per wake-request.schema.json: five REQUIRED string fields,
- * schema = const WAKE_SCHEMA, additionalProperties:false (drift alarm).
+/** Schema-exact guard per wake-request.schema.json: four REQUIRED string fields,
+ * senderId OPTIONAL string (sender-less inbound is a legal wake), schema = const WAKE_SCHEMA,
+ * additionalProperties:false (drift alarm).
  * Exported so the contract-conformance test can run the SDK golden fixtures through it. */
 export function isWakeRequest(v: unknown): v is WakeRequest {
 	if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
 	const o = v as Record<string, unknown>;
-	if (!Object.keys(o).every((k) => (WAKE_FIELDS as readonly string[]).includes(k))) return false;
+	if (!Object.keys(o).every((k) => (WAKE_ALLOWED_FIELDS as readonly string[]).includes(k))) return false;
 	if (o.schema !== WAKE_SCHEMA) return false;
-	return WAKE_FIELDS.every((f) => typeof o[f] === "string");
+	if (!WAKE_REQUIRED_FIELDS.every((f) => typeof o[f] === "string")) return false;
+	return !("senderId" in o) || typeof o.senderId === "string";
 }
 function isSendRequest(v: unknown): v is SendRequest {
 	const o = v as Record<string, unknown>;
@@ -81,7 +84,7 @@ export function startAdapterServer(deps: AdapterServerDeps, port = 0): Promise<A
 				// a transport-level non-2xx would wrongly trigger its own retry semantics.
 				const resp = await deps
 					.handleWake(body)
-					.catch((): WakeResponse => ({ ok: false, failureClass: "runtime_error", retryAfterMs: 15_000 }));
+					.catch((): WakeResponse => ({ ok: false, failureClass: "wake_failed", retryAfterMs: 15_000 }));
 				return send(200, resp);
 			}
 			if (req.url === "/send") {

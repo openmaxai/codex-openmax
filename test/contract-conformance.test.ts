@@ -1,7 +1,9 @@
 // Contract conformance against the canonical cws-comm protocol contract.
-// Fixtures are vendored VERBATIM from @openmaxai/openmax-agent-sdk (PR #1, commit 7fc6949)
+// Fixtures are vendored VERBATIM from @openmaxai/openmax-agent-sdk@0.1.0-alpha.2
 // fixtures/v1/ — the language-neutral golden corpus whose passing defines "protocol-conformant"
 // (see that repo's CONTRACT.md). Re-vendor when the contract version bumps.
+// The canonical failureClass enum is read from the INSTALLED SDK's schema at test time, so a
+// contract bump that changes the enum fails here instead of drifting silently.
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it, expect } from "vitest";
@@ -9,6 +11,11 @@ import { isWakeRequest } from "../src/adapter/server.js";
 import type { WakeResponse } from "../src/types.js";
 
 const FIXTURES = join(__dirname, "fixtures", "contract-v1");
+const SDK_SCHEMAS = join(__dirname, "..", "node_modules", "@openmaxai", "openmax-agent-sdk", "schemas", "v1");
+
+const CANONICAL_FAILURE_CLASSES: string[] = JSON.parse(
+	readFileSync(join(SDK_SCHEMAS, "failure-class.schema.json"), "utf8"),
+).enum;
 
 function loadFixtures(dir: string): Array<{ file: string; description: string; input: unknown; expectValid: boolean }> {
 	return readdirSync(join(FIXTURES, dir))
@@ -17,9 +24,30 @@ function loadFixtures(dir: string): Array<{ file: string; description: string; i
 		.map((f) => ({ file: f, ...JSON.parse(readFileSync(join(FIXTURES, dir, f), "utf8")) }));
 }
 
+/** Exact implementation of wake-result.schema.json (oneOf success/failure,
+ * failureClass = canonical enum by $ref, additionalProperties:false both branches). */
+function isWakeResult(v: unknown): boolean {
+	if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+	const o = v as Record<string, unknown>;
+	if (o.ok === true) {
+		if (!Object.keys(o).every((k) => k === "ok" || k === "runtimeSession")) return false;
+		return !("runtimeSession" in o) || typeof o.runtimeSession === "string";
+	}
+	if (o.ok === false) {
+		if (!Object.keys(o).every((k) => ["ok", "failureClass", "retryAfterMs"].includes(k))) return false;
+		if (typeof o.failureClass !== "string" || !CANONICAL_FAILURE_CLASSES.includes(o.failureClass)) return false;
+		if ("retryAfterMs" in o) {
+			return typeof o.retryAfterMs === "number" && Number.isInteger(o.retryAfterMs) && o.retryAfterMs >= 0;
+		}
+		return true;
+	}
+	return false;
+}
+
 describe("contract conformance: wake-request (SDK golden fixtures)", () => {
 	// Our /wake body guard IS this adapter's implementation of wake-request.schema.json —
-	// it must agree with every golden fixture, valid and drift-negative alike.
+	// it must agree with every golden fixture, valid and drift-negative alike
+	// (incl. 04-sender-less: senderId is OPTIONAL, a sender-less wake is legal).
 	for (const fx of loadFixtures("wake-request")) {
 		it(`${fx.file}: ${fx.description}`, () => {
 			expect(isWakeRequest(fx.input)).toBe(fx.expectValid);
@@ -28,44 +56,35 @@ describe("contract conformance: wake-request (SDK golden fixtures)", () => {
 });
 
 describe("contract conformance: wake-result (producer side)", () => {
-	// We are the PRODUCER of wake-result (the SDK validates); what we can pin here is that
-	// every response shape this adapter emits carries exactly the schema's keys
-	// ({ok, runtimeSession?} | {ok, failureClass, retryAfterMs?}, additionalProperties:false).
-	// KNOWN DELTA (raised on openmax-agent-sdk PR #1): our failureClass values
-	// (no_active_turn/runtime_busy/inject_failed/runtime_error/unknown) are finer-grained than
-	// the v1 canonical enum (no_inbound_provider/wake_failed) — a contract-revision proposal to
-	// enumerate adapter-side diagnostic classes is pending; the JS SDK treats the field as an
-	// open string meanwhile, so this is a contract-text gap, not a runtime break.
-	const emitted: WakeResponse[] = [
-		{ ok: true },
-		{ ok: true, runtimeSession: "thr_1" },
-		{ ok: false, failureClass: "runtime_busy", retryAfterMs: 2000 },
-		{ ok: false, failureClass: "runtime_error" },
-	];
-	it("every emitted shape carries exactly the schema's keys (additionalProperties:false)", () => {
-		for (const r of emitted) {
-			const allowed = r.ok ? ["ok", "runtimeSession"] : ["ok", "failureClass", "retryAfterMs"];
-			expect(Object.keys(r).every((k) => allowed.includes(k))).toBe(true);
-			if (!r.ok) expect(typeof r.failureClass).toBe("string");
-			if (!r.ok && r.retryAfterMs !== undefined) {
-				expect(Number.isInteger(r.retryAfterMs)).toBe(true);
-				expect(r.retryAfterMs).toBeGreaterThanOrEqual(0);
-			}
-		}
+	// We are the PRODUCER of wake-result. Two obligations, both enforced strictly:
+	// (a) our local validator must agree with every golden fixture — including
+	//     07-unknown-failure-class, the drift alarm that rejects unenumerated classes;
+	// (b) every response shape this adapter can emit must pass that validator, i.e.
+	//     failureClass on the wire is ALWAYS the canonical v1 enum. The adapter's
+	//     finer-grained diagnostics (types.ts FailureClass) never leave the process —
+	//     they only inform retryAfterMs and logging.
+	for (const fx of loadFixtures("wake-result")) {
+		it(`${fx.file}: ${fx.description}`, () => {
+			expect(isWakeResult(fx.input)).toBe(fx.expectValid);
+		});
+	}
+
+	it("canonical enum in the installed SDK is what our wire type promises", () => {
+		// If the SDK revises the enum (e.g. accepting the adapter-classes proposal),
+		// this pins the moment: update WireFailureClass + the mapping, then re-vendor.
+		expect(CANONICAL_FAILURE_CLASSES).toEqual(["no_inbound_provider", "wake_failed"]);
 	});
-	it("structural fixtures we can honor as producer agree (ok/failure key discipline)", () => {
-		// 05-fail-missing-class (invalid: ok:false without failureClass) and
-		// 06-ok-with-failure-class (invalid: ok:true carrying failureClass) are the two
-		// producer-side mistakes possible in this codebase; assert our type space forbids them.
-		const failMissingClass = JSON.parse(readFileSync(join(FIXTURES, "wake-result", "05-fail-missing-class.json"), "utf8"));
-		const okWithClass = JSON.parse(readFileSync(join(FIXTURES, "wake-result", "06-ok-with-failure-class.json"), "utf8"));
-		expect(failMissingClass.expectValid).toBe(false);
-		expect(okWithClass.expectValid).toBe(false);
-		// Mirror check on our real emitted values above: no ok:true carries failureClass,
-		// every ok:false carries one.
-		for (const r of emitted) {
-			if (r.ok) expect("failureClass" in r).toBe(false);
-			else expect(r.failureClass.length).toBeGreaterThan(0);
-		}
+
+	it("every emitted response shape validates against wake-result.schema.json (enum-strict)", () => {
+		// One sample per emission site/path in this codebase:
+		const emitted: WakeResponse[] = [
+			{ ok: true }, // inject delivered (no session id)
+			{ ok: true, runtimeSession: "thr_1" }, // inject delivered
+			{ ok: false, failureClass: "wake_failed", retryAfterMs: 2000 }, // wake-queue backpressure shed (internal: runtime_busy)
+			{ ok: false, failureClass: "wake_failed", retryAfterMs: 5000 }, // inject unconfirmed (internal: inject_failed)
+			{ ok: false, failureClass: "wake_failed", retryAfterMs: 15_000 }, // server/sdk-bridge catch (internal: runtime_error)
+			{ ok: false, failureClass: "wake_failed" }, // auth-terminal (no backoff hint)
+		];
+		for (const r of emitted) expect(isWakeResult(r)).toBe(true);
 	});
 });

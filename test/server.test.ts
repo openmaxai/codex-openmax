@@ -43,21 +43,56 @@ describe("adapter HTTP server (P1 MVP)", () => {
 		);
 	});
 
+	it("KILLING (R1): a sender-less wake (senderId omitted) is ACCEPTED — SDK v1 marks senderId optional (fixture 04)", async () => {
+		const { senderId: _omitted, ...senderless } = WAKE;
+		let seen: WakeRequest | null = null;
+		await withServer(
+			{
+				handleWake: async (w) => {
+					seen = w;
+					return { ok: true };
+				},
+				handleSend: async () => ({ ok: true, messageId: "x" }),
+			},
+			async (base) => {
+				const res = await fetch(`${base}/wake`, { method: "POST", body: JSON.stringify(senderless) });
+				expect(res.status).toBe(200); // NOT 400 "invalid WakeRequest"
+				expect(await res.json()).toEqual({ ok: true });
+				expect(seen).toEqual(senderless);
+				expect(seen && "senderId" in seen).toBe(false);
+			},
+		);
+	});
+
+	it("a NON-STRING senderId is still rejected (optional ≠ any type)", async () => {
+		const res400 = { ...WAKE, senderId: 42 as unknown as string };
+		await withServer(
+			{
+				handleWake: async () => ({ ok: true }),
+				handleSend: async () => ({ ok: true, messageId: "x" }),
+			},
+			async (base) => {
+				const res = await fetch(`${base}/wake`, { method: "POST", body: JSON.stringify(res400) });
+				expect(res.status).toBe(400);
+			},
+		);
+	});
+
 	it("KILLING: /wake returns HTTP 200 even when delivery fails (ok:false) — non-2xx would trip caller retry", async () => {
 		await withServer(
 			{
-				handleWake: async (): Promise<WakeResponse> => ({ ok: false, failureClass: "inject_failed", retryAfterMs: 5000 }),
+				handleWake: async (): Promise<WakeResponse> => ({ ok: false, failureClass: "wake_failed", retryAfterMs: 5000 }),
 				handleSend: async () => ({ ok: true, messageId: "x" }),
 			},
 			async (base) => {
 				const res = await fetch(`${base}/wake`, { method: "POST", body: JSON.stringify(WAKE) });
 				expect(res.status).toBe(200); // typed failure, not a transport error
-				expect(await res.json()).toEqual({ ok: false, failureClass: "inject_failed", retryAfterMs: 5000 });
+				expect(await res.json()).toEqual({ ok: false, failureClass: "wake_failed", retryAfterMs: 5000 });
 			},
 		);
 	});
 
-	it("a throwing handleWake is contained as ok:false runtime_error (200)", async () => {
+	it("a throwing handleWake is contained as ok:false wake_failed (200)", async () => {
 		await withServer(
 			{
 				handleWake: async () => {

@@ -1,0 +1,10 @@
+{
+  "description": "A sender-less wake request validates: senderId is optional (mirrors the optional senderId on the normalized InboundMessage — the SDK still delivers a message whose sender could not be resolved).",
+  "input": {
+    "schema": "raft-channel-wake.v1",
+    "messageId": "m1",
+    "conversationId": "c1",
+    "contentPreview": "hello there"
+  },
+  "expectValid": true
+}

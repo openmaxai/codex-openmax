@@ -73,7 +73,7 @@ export async function main(bridge: CwsBridge = createMockCwsBridge()): Promise<R
 			return resp;
 		} catch (e) {
 			log(`inbound /wake failed: ${String(e)}`);
-			return { ok: false, failureClass: "runtime_error", retryAfterMs: 15_000 };
+			return { ok: false, failureClass: "wake_failed", retryAfterMs: 15_000 };
 		}
 	});
 
