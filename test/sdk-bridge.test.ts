@@ -124,6 +124,16 @@ describe("sdk-bridge: outbound routing (conversationId → endpoint/orgId regist
 		expect(await bridge.send({ conversationId: "conv_A", content: "x" })).toEqual({ ok: false });
 	});
 
+	it("KILLING (gavin R1): a NUMERIC conversation_id from the live server still routes outbound — route key is coerced like the wake path", async () => {
+		const { bridge, sends, deliver } = harness();
+		bridge.onInbound(async () => OK);
+		// live finding: server delivers ids as JSON numbers despite the string schema
+		await deliver(msg({ conversationId: 123 as unknown as string, endpoint: "123|thread:t1" }), "123|thread:t1");
+		const res = await bridge.send({ conversationId: "123", content: "reply" });
+		expect(res).toEqual({ ok: true, messageId: "cws_9" }); // NOT the no-route {ok:false}
+		expect(sends).toEqual([{ endpoint: "123|thread:t1", content: "reply", opts: { orgId: "org_1", replyTo: undefined } }]);
+	});
+
 	it("sdk.send result without a string messageId → ok without id (shape is SDK-version tolerant)", async () => {
 		const { bridge, deliver } = harness(async () => ({ some: "other-shape" }));
 		bridge.onInbound(async () => OK);

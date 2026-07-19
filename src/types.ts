@@ -30,7 +30,9 @@ export interface SendRequest {
 	content: string;
 	replyTo?: string;
 }
-export type SendResponse = { ok: true; messageId: string } | { ok: false; failureClass: FailureClass };
+/** messageId is optional on success: the bridge can confirm delivery without echoing an id
+ * (e.g. SDK send result without messageId) — success must not be downgraded for lack of it. */
+export type SendResponse = { ok: true; messageId?: string } | { ok: false; failureClass: FailureClass };
 
 /** INTERNAL adapter failure diagnostics (retryable vs terminal, backoff hints — invariants.ts).
  * NOT a wire value for /wake responses: canonical v1 only admits WireFailureClass there.

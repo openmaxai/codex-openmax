@@ -32,7 +32,9 @@ export async function injectWake(
 		}
 		return { ok: true, runtimeSession: threadId };
 	} catch (err) {
-		// Auth failures are terminal — no retryAfterMs, so upstream won't loop on a bad key.
+		// Auth failures: per v1 semantics ANY ok:false is still redelivered on the next /sync
+		// sweep — omitting retryAfterMs only removes the backoff hint, it cannot stop the loop
+		// (terminal-no-retry is inexpressible in v1; contract-revision proposal pending).
 		if (isAuthTerminal(err)) return { ok: false, failureClass: "wake_failed" };
 		const diagnosed = classifyFailure(err);
 		return { ok: false, failureClass: "wake_failed", retryAfterMs: retryAfterMs(diagnosed) };

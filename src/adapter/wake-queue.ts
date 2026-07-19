@@ -42,14 +42,22 @@ export function createWakeQueue(
 	// Per-conversation FIFO: the tail promise each new wake chains onto (invariant 1).
 	const tails = new Map<string, Promise<unknown>>();
 	const depths = new Map<string, number>();
-	// messageId -> the in-flight attempt's promise (invariant 2, coalesce).
+	// Dedup keys are SCOPED PER CONVERSATION (`${conversationId}:${messageId}`) to match the
+	// serialization/backpressure model: if messageIds were only unique within a conversation,
+	// a bare-messageId key would let conv A's delivered id answer conv B's wake as idempotent
+	// ok:true WITHOUT injecting into B — exactly the false-success this module exists to prevent.
+	const dedupKey = (w: WakeRequest) => `${w.conversationId}:${w.messageId}`;
+	// dedup key -> the in-flight attempt's promise (invariant 2, coalesce).
 	const inFlight = new Map<string, Promise<WakeResponse>>();
-	// messageId -> runtimeSession of a confirmed delivery; Map iteration order = LRU order.
+	// dedup key -> runtimeSession of a confirmed delivery; Map iteration order = LRU order.
+	// NOTE (operational limit): the LRU cap is GLOBAL (default 512), so under many concurrent
+	// conversations the effective per-conversation replay window shrinks; after eviction a
+	// redelivery re-injects (duplicate in model-visible history). Acceptable for MVP.
 	const recentDelivered = new Map<string, string | undefined>();
 
-	function recordDelivered(messageId: string, runtimeSession: string | undefined) {
-		recentDelivered.delete(messageId); // refresh position
-		recentDelivered.set(messageId, runtimeSession);
+	function recordDelivered(key: string, runtimeSession: string | undefined) {
+		recentDelivered.delete(key); // refresh position
+		recentDelivered.set(key, runtimeSession);
 		while (recentDelivered.size > deliveredCapacity) {
 			const oldest = recentDelivered.keys().next().value as string;
 			recentDelivered.delete(oldest);
@@ -59,14 +67,15 @@ export function createWakeQueue(
 	return {
 		depth: (conversationId) => depths.get(conversationId) ?? 0,
 		enqueue(wake) {
+			const key = dedupKey(wake);
 			// Already confirmed delivered → idempotent success, never a second inject.
-			if (recentDelivered.has(wake.messageId)) {
-				const runtimeSession = recentDelivered.get(wake.messageId);
-				recordDelivered(wake.messageId, runtimeSession); // keep hot ids resident
+			if (recentDelivered.has(key)) {
+				const runtimeSession = recentDelivered.get(key);
+				recordDelivered(key, runtimeSession); // keep hot ids resident
 				return Promise.resolve<WakeResponse>({ ok: true, ...(runtimeSession ? { runtimeSession } : {}) });
 			}
 			// Same attempt still in flight → coalesce onto it, never a second inject.
-			const existing = inFlight.get(wake.messageId);
+			const existing = inFlight.get(key);
 			if (existing) return existing;
 			// Backpressure: shed with the caller's own retry semantics instead of queueing forever.
 			const cid = wake.conversationId;
@@ -95,7 +104,7 @@ export function createWakeQueue(
 					return { ok: false, failureClass: "wake_failed", retryAfterMs: retryAfterMs(diagnosed) };
 				})
 				.then((res) => {
-					inFlight.delete(wake.messageId);
+					inFlight.delete(key);
 					const d = (depths.get(cid) ?? 1) - 1;
 					if (d <= 0) {
 						depths.delete(cid);
@@ -104,11 +113,11 @@ export function createWakeQueue(
 						depths.set(cid, d);
 					}
 					// Only a CONFIRMED delivery becomes idempotent (invariant 4).
-					if (res.ok) recordDelivered(wake.messageId, res.runtimeSession);
+					if (res.ok) recordDelivered(key, res.runtimeSession);
 					return res;
 				});
 			tails.set(cid, attempt);
-			inFlight.set(wake.messageId, attempt);
+			inFlight.set(key, attempt);
 			return attempt;
 		},
 	};

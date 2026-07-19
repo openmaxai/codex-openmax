@@ -3,7 +3,7 @@
 // inbound message it POSTs the local /wake; /send is emitted back to CWS via the SDK.
 // The SDK is NOT npm-published yet, so P1 MVP ships a MOCK bridge that implements the same
 // interface — swap in the SDK-backed impl when it lands (no caller change).
-import type { SendRequest, WakeRequest, WakeResponse } from "../types.js";
+import type { SendRequest, SendResponse, WakeRequest, WakeResponse } from "../types.js";
 
 export interface CwsBridge {
 	/** Connect to CWS and begin delivering inbound messages to the registered wake handler. */
@@ -18,6 +18,15 @@ export interface CwsBridge {
 	/** Emit a runtime reply back to CWS. Returns the platform message id on success. */
 	send(req: SendRequest): Promise<{ ok: boolean; messageId?: string }>;
 	stop(): Promise<void>;
+}
+
+/** Map a bridge send result onto the /send local contract. Gates on `ok` ALONE: a confirmed
+ * send without a messageId is still a success — downgrading it would make the runtime retry
+ * an already-delivered reply (duplicate send). */
+export function toSendResponse(r: { ok: boolean; messageId?: string }): SendResponse {
+	return r.ok
+		? { ok: true, ...(r.messageId ? { messageId: r.messageId } : {}) }
+		: { ok: false, failureClass: "runtime_error" };
 }
 
 export interface MockCwsBridge extends CwsBridge {

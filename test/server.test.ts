@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { startAdapterServer } from "../src/adapter/server.js";
-import { createMockCwsBridge } from "../src/bridge/cws-bridge.js";
+import { createMockCwsBridge, toSendResponse } from "../src/bridge/cws-bridge.js";
 import type { SendRequest, WakeRequest, WakeResponse } from "../src/types.js";
 
 const WAKE: WakeRequest = {
@@ -131,10 +131,7 @@ describe("adapter HTTP server (P1 MVP)", () => {
 					injected.push(w);
 					return { ok: true, runtimeSession: "thr_1" };
 				},
-				handleSend: async (req: SendRequest) => {
-					const r = await bridge.send(req);
-					return r.ok && r.messageId ? { ok: true, messageId: r.messageId } : { ok: false, failureClass: "runtime_error" };
-				},
+				handleSend: async (req: SendRequest) => toSendResponse(await bridge.send(req)),
 			},
 			async (base) => {
 				// Inbound: bridge delivers a CWS message → /wake.

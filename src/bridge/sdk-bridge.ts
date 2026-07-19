@@ -72,7 +72,10 @@ export function createSdkCwsBridge(makeBridge: (deliver: SdkInboundDeliver) => S
 	const routes = new Map<string, { endpoint: string; orgId: string }>();
 
 	const deliver: SdkInboundDeliver = async (msg, endpoint) => {
-		routes.set(msg.conversationId, { endpoint, orgId: msg.orgId });
+		// Coerce the route key like the wake path does (toWakeRequest): the live server
+		// delivers ids as JSON numbers despite the string schema, and SendRequest.conversationId
+		// is a string — routes.set(123,…) would miss routes.get("123") and drop the reply.
+		routes.set(String(msg.conversationId), { endpoint, orgId: msg.orgId });
 		if (!handler) {
 			// No runtime wired yet: fail typed (SDK holds its markers and redelivers) — never ok.
 			return { ok: false, failureClass: "wake_failed", retryAfterMs: 15_000 };

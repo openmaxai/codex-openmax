@@ -6,7 +6,7 @@ import { attachOutbound } from "./adapter/outbound.js";
 import { createCodexClient, spawnAppServerTransport } from "./adapter/codex-client.js";
 import { injectWake } from "./adapter/inject.js";
 import { startAdapterServer } from "./adapter/server.js";
-import { createMockCwsBridge, type CwsBridge } from "./bridge/cws-bridge.js";
+import { createMockCwsBridge, toSendResponse, type CwsBridge } from "./bridge/cws-bridge.js";
 import { createWakeQueue } from "./adapter/wake-queue.js";
 import { loadConfig } from "./config.js";
 import type { SendRequest, WakeRequest, WakeResponse } from "./types.js";
@@ -50,7 +50,7 @@ export async function main(bridge: CwsBridge = createMockCwsBridge()): Promise<R
 	const server = await startAdapterServer(
 		{
 			handleWake: (wake: WakeRequest) => wakeQueue.enqueue(wake),
-			handleSend: (req: SendRequest) => bridge.send(req).then((r) => (r.ok && r.messageId ? { ok: true as const, messageId: r.messageId } : { ok: false as const, failureClass: "runtime_error" as const })),
+			handleSend: (req: SendRequest) => bridge.send(req).then(toSendResponse),
 			log,
 		},
 		config.bridge.localHttpPort,

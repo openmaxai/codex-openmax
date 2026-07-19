@@ -126,7 +126,7 @@ describe("wake queue (P1 backpressure + concurrency)", () => {
 		expect((await r2).ok).toBe(true);
 	});
 
-	it("a 401-throwing processor maps to TERMINAL wake_failed with NO retryAfterMs (upstream must not loop on a bad key)", async () => {
+	it("a 401-throwing processor maps to wake_failed with NO retryAfterMs (backoff hint withheld; v1 still redelivers — terminal is inexpressible)", async () => {
 		const p = controlledProcessor();
 		const q = createWakeQueue(p.process);
 		const r1 = q.enqueue(wake("m1"));
@@ -170,5 +170,19 @@ describe("wake queue (P1 backpressure + concurrency)", () => {
 		p.settlers[1](OK);
 		await r2;
 		expect(q.depth("conv_A")).toBe(0);
+	});
+
+	it("KILLING (gavin R1): dedup is scoped PER CONVERSATION — a delivered messageId in conv A must NOT idempotent-answer the same id in conv B (that would silently drop B's message)", async () => {
+		const p = controlledProcessor();
+		const q = createWakeQueue(p.process);
+		const rA = q.enqueue(wake("m1", "conv_A"));
+		await tick();
+		p.settlers[0](OK);
+		await rA; // m1 delivered in conv A
+		const rB = q.enqueue(wake("m1", "conv_B")); // same messageId, DIFFERENT conversation
+		await tick();
+		expect(p.calls).toEqual(["m1", "m1"]); // B's wake MUST reach the processor
+		p.settlers[1]({ ok: true, runtimeSession: "thr_B" });
+		expect(await rB).toEqual({ ok: true, runtimeSession: "thr_B" });
 	});
 });
