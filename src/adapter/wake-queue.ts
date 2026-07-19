@@ -42,11 +42,13 @@ export function createWakeQueue(
 	// Per-conversation FIFO: the tail promise each new wake chains onto (invariant 1).
 	const tails = new Map<string, Promise<unknown>>();
 	const depths = new Map<string, number>();
-	// Dedup keys are SCOPED PER CONVERSATION (`${conversationId}:${messageId}`) to match the
-	// serialization/backpressure model: if messageIds were only unique within a conversation,
-	// a bare-messageId key would let conv A's delivered id answer conv B's wake as idempotent
-	// ok:true WITHOUT injecting into B — exactly the false-success this module exists to prevent.
-	const dedupKey = (w: WakeRequest) => `${w.conversationId}:${w.messageId}`;
+	// Dedup keys are SCOPED PER CONVERSATION to match the serialization/backpressure model:
+	// if messageIds were only unique within a conversation, a bare-messageId key would let
+	// conv A's delivered id answer conv B's wake as idempotent ok:true WITHOUT injecting into
+	// B — exactly the false-success this module exists to prevent. The key is a JSON tuple,
+	// NOT a delimiter join: both ids are unconstrained strings, so `${cid}:${mid}` would
+	// collide ("a:b","c") with ("a","b:c") and falsely swallow a legitimate second message.
+	const dedupKey = (w: WakeRequest) => JSON.stringify([w.conversationId, w.messageId]);
 	// dedup key -> the in-flight attempt's promise (invariant 2, coalesce).
 	const inFlight = new Map<string, Promise<WakeResponse>>();
 	// dedup key -> runtimeSession of a confirmed delivery; Map iteration order = LRU order.

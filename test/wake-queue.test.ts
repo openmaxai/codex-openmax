@@ -185,4 +185,18 @@ describe("wake queue (P1 backpressure + concurrency)", () => {
 		p.settlers[1]({ ok: true, runtimeSession: "thr_B" });
 		expect(await rB).toEqual({ ok: true, runtimeSession: "thr_B" });
 	});
+
+	it("KILLING (0t R3): dedup key is delimiter-collision-proof — (cid='a:b', mid='c') delivered must NOT swallow (cid='a', mid='b:c')", async () => {
+		const p = controlledProcessor();
+		const q = createWakeQueue(p.process);
+		const r1 = q.enqueue(wake("c", "a:b"));
+		await tick();
+		p.settlers[0](OK);
+		await r1; // ("a:b","c") delivered
+		const r2 = q.enqueue(wake("b:c", "a")); // naive `${cid}:${mid}` would collide to "a:b:c"
+		await tick();
+		expect(p.calls).toEqual(["c", "b:c"]); // the second wake MUST reach the processor
+		p.settlers[1]({ ok: true, runtimeSession: "thr_2" });
+		expect(await r2).toEqual({ ok: true, runtimeSession: "thr_2" });
+	});
 });
