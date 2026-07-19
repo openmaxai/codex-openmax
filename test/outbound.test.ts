@@ -64,3 +64,15 @@ describe("outbound capture", () => {
 		expect(warns.some((w) => w.includes("bridge down"))).toBe(true);
 	});
 });
+
+// gavin R1 item 2: /send gating must be on `ok` alone.
+import { toSendResponse } from "../src/bridge/cws-bridge.js";
+describe("toSendResponse (/send local contract gating)", () => {
+	it("KILLING (gavin R1): a confirmed send WITHOUT a messageId is still ok:true — downgrading it would cause a duplicate outbound retry", () => {
+		expect(toSendResponse({ ok: true })).toEqual({ ok: true });
+	});
+	it("passes messageId through when present; failure maps typed", () => {
+		expect(toSendResponse({ ok: true, messageId: "cws_1" })).toEqual({ ok: true, messageId: "cws_1" });
+		expect(toSendResponse({ ok: false })).toEqual({ ok: false, failureClass: "runtime_error" });
+	});
+});

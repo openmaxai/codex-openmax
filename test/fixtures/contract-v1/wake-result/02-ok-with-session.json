@@ -1,0 +1,5 @@
+{
+  "description": "A success result with a runtimeSession validates.",
+  "input": { "ok": true, "runtimeSession": "sess-abc" },
+  "expectValid": true
+}

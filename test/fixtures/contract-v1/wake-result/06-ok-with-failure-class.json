@@ -1,0 +1,5 @@
+{
+  "description": "ok:true must not carry a failureClass (additionalProperties:false on the success branch) — a contradictory result is rejected.",
+  "input": { "ok": true, "failureClass": "wake_failed" },
+  "expectValid": false
+}

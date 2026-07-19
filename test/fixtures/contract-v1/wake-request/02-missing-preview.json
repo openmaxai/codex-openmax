@@ -1,0 +1,10 @@
+{
+  "description": "Missing contentPreview is rejected (contentPreview is required; senderId is not).",
+  "input": {
+    "schema": "raft-channel-wake.v1",
+    "messageId": "m1",
+    "conversationId": "c1",
+    "senderId": "u1"
+  },
+  "expectValid": false
+}

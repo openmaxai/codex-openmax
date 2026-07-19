@@ -1,0 +1,5 @@
+{
+  "description": "A failure result with failureClass=wake_failed and a retryAfterMs backoff hint validates.",
+  "input": { "ok": false, "failureClass": "wake_failed", "retryAfterMs": 500 },
+  "expectValid": true
+}

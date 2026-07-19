@@ -1,0 +1,5 @@
+{
+  "description": "A bare success result validates.",
+  "input": { "ok": true },
+  "expectValid": true
+}

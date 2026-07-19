@@ -1,0 +1,5 @@
+{
+  "description": "ok:false without a failureClass is rejected (a failure must name its class).",
+  "input": { "ok": false, "retryAfterMs": 500 },
+  "expectValid": false
+}

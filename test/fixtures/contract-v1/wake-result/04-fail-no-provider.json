@@ -1,0 +1,5 @@
+{
+  "description": "The SDK default (no InboundDelivery supplied) failure result validates.",
+  "input": { "ok": false, "failureClass": "no_inbound_provider" },
+  "expectValid": true
+}

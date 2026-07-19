@@ -1,0 +1,5 @@
+{
+  "description": "An unenumerated failureClass is rejected — this is the drift alarm that forces a contract revision when a new class appears.",
+  "input": { "ok": false, "failureClass": "totally_new_class" },
+  "expectValid": false
+}
