@@ -6,8 +6,9 @@
 //   start — load config.json -> real SDK bridge -> main() (adapter server), foreground,
 //           graceful SIGINT/SIGTERM.
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
-import { buildConfig, type FetchLike, type OnboardInput } from "./onboarding.js";
+import * as fs from "node:fs";
+import { readFileSync } from "node:fs";
+import { buildConfig, writeConfigFile, type FetchLike, type OnboardInput } from "./onboarding.js";
 
 function usage(): never {
 	console.error(`usage:
@@ -39,7 +40,7 @@ async function cmdInit(args: string[]): Promise<void> {
 	}
 	try {
 		const config = await buildConfig(globalThis.fetch as unknown as FetchLike, input);
-		writeFileSync("config.json", `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+		writeConfigFile(fs, "config.json", config); // 0600 guaranteed even on overwrite (temp + atomic rename)
 		// Preflight (warn-only here; `start` hard-fails): the runtime this adapter drives.
 		let codexOk = false;
 		try {

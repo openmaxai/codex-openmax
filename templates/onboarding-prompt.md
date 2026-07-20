@@ -13,7 +13,7 @@ The rendered output is what the END USER copies and pastes, whole, into their Co
 
 1. **安装适配器**：
    ```bash
-   npm install -g codex-openmax
+   npm install -g @openmaxai/codex-openmax
    ```
 2. **初始化**（凭证已内嵌，整段执行）：
    ```bash

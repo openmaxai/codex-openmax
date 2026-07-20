@@ -9,7 +9,10 @@ export type FetchLike = (url: string, init?: { method?: string; headers?: Record
 	text(): Promise<string>;
 }>;
 
-async function postJson(fetchFn: FetchLike, url: string, body: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {
+/** `label` is the REDACTED endpoint name used in every user-visible error — never the raw
+ * URL: the invitation-accept URL embeds the invitation id, and the prompt contract promises
+ * failures can be pasted back without leaking credential material. */
+async function postJson(fetchFn: FetchLike, url: string, label: string, body: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {
 	const res = await fetchFn(url, {
 		method: "POST",
 		headers: { "content-type": "application/json", ...headers },
@@ -20,11 +23,11 @@ async function postJson(fetchFn: FetchLike, url: string, body: unknown, headers:
 	try {
 		parsed = JSON.parse(text);
 	} catch {
-		throw new Error(`${url} → HTTP ${res.status}, non-JSON body`);
+		throw new Error(`${label} → HTTP ${res.status}, non-JSON body`);
 	}
 	if (!res.ok) {
 		const msg = (parsed as { message?: string; error?: string }).message ?? (parsed as { error?: string }).error ?? "";
-		throw new Error(`${url} → HTTP ${res.status}${msg ? `: ${msg}` : ""}`);
+		throw new Error(`${label} → HTTP ${res.status}${msg ? `: ${msg}` : ""}`);
 	}
 	// cws-core envelope: { $schema, data, request_id, ... } — unwrap when present.
 	const o = parsed as Record<string, unknown>;
@@ -47,7 +50,7 @@ export async function redeemInvitation(
 	invitationId: string,
 	token: string,
 ): Promise<RedeemResult> {
-	const data = await postJson(fetchFn, `${bffUrl}/api/v1/invitations/${invitationId}/accept`, { token });
+	const data = await postJson(fetchFn, `${bffUrl}/api/v1/invitations/${invitationId}/accept`, "invitation accept (/api/v1/invitations/…/accept)", { token });
 	const identityId = data.identity_id ?? data.identityId;
 	const apiKey = data.api_key ?? data.apiKey;
 	if (typeof identityId !== "string" || typeof apiKey !== "string") {
@@ -63,9 +66,12 @@ export async function redeemInvitation(
 	};
 }
 
-/** POST /auth/agent/token {org_id} with X-Api-Key — proven shape from the live round-trip logs. */
+/** POST /auth/agent/token {org_id} with `Authorization: Bearer <api_key>` — the shape the
+ * SDK's own TokenManager sends (transport/token.js) and cws-core reads; pinned by 0t's R1
+ * against SDK contract auth-lifecycle.md (the live logs showed URL+body only, headers were
+ * TokenManager-internal — do not "re-derive" this header from logs again). */
 export async function exchangeAgentToken(fetchFn: FetchLike, bffUrl: string, apiKey: string, orgId: string): Promise<string> {
-	const data = await postJson(fetchFn, `${bffUrl}/auth/agent/token`, { org_id: orgId }, { "x-api-key": apiKey });
+	const data = await postJson(fetchFn, `${bffUrl}/auth/agent/token`, "agent token exchange (/auth/agent/token)", { org_id: orgId }, { authorization: `Bearer ${apiKey}` });
 	const jwt = data.access_token;
 	if (typeof jwt !== "string") throw new Error(`agent token exchange returned no access_token (keys: ${Object.keys(data).join(", ")})`);
 	return jwt;
@@ -106,7 +112,12 @@ export interface OnboardInput {
 export async function buildConfig(fetchFn: FetchLike, input: OnboardInput): Promise<Record<string, unknown>> {
 	let apiKey = input.api_key;
 	let identityId = input.identity_id;
-	if (!apiKey) {
+	if (apiKey) {
+		// Direct-key path: identity_id is REQUIRED (config.ts validation demands cws.identityId;
+		// a config without it would be written here only to be rejected by `start`). Validated
+		// before any network call.
+		if (!identityId) throw new Error("api_key path requires identity_id (start's config validation demands it)");
+	} else {
 		if (!input.invitation_id || !input.invitation_token) throw new Error("need invitation_id+invitation_token or api_key");
 		const redeemed = await redeemInvitation(fetchFn, input.bff_url, input.invitation_id, input.invitation_token);
 		apiKey = redeemed.apiKey;
@@ -115,7 +126,7 @@ export async function buildConfig(fetchFn: FetchLike, input: OnboardInput): Prom
 	const jwt = await exchangeAgentToken(fetchFn, input.bff_url, apiKey, input.org_id);
 	const self = await fetchSelf(fetchFn, input.bff_url, jwt);
 	return {
-		cws: { bffUrl: input.bff_url, wsUrl: input.ws_url, ...(identityId ? { identityId } : {}), apiKey },
+		cws: { bffUrl: input.bff_url, wsUrl: input.ws_url, identityId, apiKey },
 		codex: { bin: "codex", cwd: "." },
 		bridge: { localHttpPort: input.local_http_port ?? 8787 },
 		org: {
@@ -124,4 +135,13 @@ export async function buildConfig(fetchFn: FetchLike, input: OnboardInput): Prom
 			access: { dmPolicy: "open" },
 		},
 	};
+}
+
+/** Write config.json guaranteeing FINAL 0600 permissions even when overwriting an existing
+ * (possibly wider-mode) file: writeFileSync's `mode` only applies at CREATION, so we write a
+ * fresh 0600 temp file in the same directory and atomically rename over the target. */
+export function writeConfigFile(fs: Pick<typeof import("node:fs"), "writeFileSync" | "renameSync">, path: string, config: unknown): void {
+	const tmp = `${path}.tmp-${process.pid}`;
+	fs.writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+	fs.renameSync(tmp, path);
 }

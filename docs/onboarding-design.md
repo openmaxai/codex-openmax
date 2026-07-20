@@ -60,3 +60,25 @@ Steps:
 - No platform-side rendering (that's the workspace flow, tracked with luna/gavin).
 - No daemonization/pm2 packaging (`start` runs foreground; supervisor integration later).
 - No ws/daemon transport (P2 item ② — codex 0.144.5's `app-server --listen ws://`).
+
+## Distribution (added after owner review, 2026-07-20)
+
+The prompt's step 1 is `npm install -g @openmaxai/codex-openmax` — which requires the
+package to actually be on npm. Decisions (owner-agreed):
+
+- **Published name: `@openmaxai/codex-openmax`** (org scope — brand-consistent with
+  `@openmaxai/openmax-agent-sdk`, and the bare name is squattable). Both names were
+  verified unclaimed on 2026-07-20. The bin remains `codex-openmax`.
+- **Release mechanics: copied from the SDK repo** (`.github/workflows/release.yml`):
+  `v*` tag → GitHub Actions → npm publish with provenance, gated on the protected
+  `release` environment (human approval) and a tag-must-be-on-main ancestry check.
+  One adaptation: a build step (this repo ships compiled `dist/`).
+- **Package payload** (`files`): `dist/`, `templates/`, `docs/`, README. `prepack`
+  runs the build so a stray manual `npm pack` can't ship stale artifacts.
+- **Versioning**: prerelease `0.1.0-alpha.N` while the platform-side prompt rendering
+  is unshipped, mirroring the SDK's convention (and its dist-tag lesson: prereleases
+  move `latest` while no stable exists).
+- **Needs org side**: npm publish credentials for `@openmaxai` (reuse the SDK's
+  NPM_TOKEN / release-environment setup — owner/gavin to wire the repo secret).
+- Interim fallback (not the official path): `npm install -g github:openmaxai/codex-openmax`
+  would need a `prepare` script; deliberately NOT added — one blessed install path.
