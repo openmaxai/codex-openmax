@@ -138,10 +138,21 @@ export async function buildConfig(fetchFn: FetchLike, input: OnboardInput): Prom
 }
 
 /** Write config.json guaranteeing FINAL 0600 permissions even when overwriting an existing
- * (possibly wider-mode) file: writeFileSync's `mode` only applies at CREATION, so we write a
- * fresh 0600 temp file in the same directory and atomically rename over the target. */
-export function writeConfigFile(fs: Pick<typeof import("node:fs"), "writeFileSync" | "renameSync">, path: string, config: unknown): void {
+ * (possibly wider-mode) file. Three layers, because `writeFileSync`'s `mode` only applies at
+ * CREATION (0t R1) — including for the TEMP file itself if its predictable path pre-exists
+ * (0t R2, same root cause one level down):
+ *   1. remove any stale/planted temp first — never truncate-in-place a file we didn't create;
+ *   2. exclusive create (`wx`) — if something races the temp back in, we throw instead of
+ *      inheriting its mode;
+ *   3. explicit chmod 0600 before rename — holds regardless of creation semantics or umask. */
+export function writeConfigFile(
+	fs: Pick<typeof import("node:fs"), "writeFileSync" | "renameSync" | "rmSync" | "chmodSync">,
+	path: string,
+	config: unknown,
+): void {
 	const tmp = `${path}.tmp-${process.pid}`;
-	fs.writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+	fs.rmSync(tmp, { force: true });
+	fs.writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+	fs.chmodSync(tmp, 0o600);
 	fs.renameSync(tmp, path);
 }

@@ -135,4 +135,17 @@ describe("writeConfigFile (0600 guarantee)", () => {
 		expect(JSON.parse(fs.readFileSync(target, "utf8"))).toEqual({ a: 1 });
 		fs.rmSync(dir, { recursive: true, force: true });
 	});
+
+	it("KILLING (0t R2): a PRE-EXISTING 0644 temp file at the predictable path cannot leak into a 0644 config (0t's exact repro)", () => {
+		const dir = fs.mkdtempSync(join(tmpdir(), "cfg-"));
+		const target = join(dir, "config.json");
+		const tmp = `${target}.tmp-${process.pid}`;
+		fs.writeFileSync(tmp, "planted", { mode: 0o644 });
+		expect(fs.statSync(tmp).mode & 0o777).toBe(0o644); // precondition: loose stale temp
+		writeConfigFile(fs, target, { a: 2 });
+		expect(fs.statSync(target).mode & 0o777).toBe(0o600);
+		expect(JSON.parse(fs.readFileSync(target, "utf8"))).toEqual({ a: 2 });
+		expect(fs.existsSync(tmp)).toBe(false); // temp consumed by rename
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
 });
