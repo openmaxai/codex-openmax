@@ -80,12 +80,16 @@ connects the SDK bridge, and serves the adapter until `SIGINT`/`SIGTERM`. Requir
 binary on `PATH`. Full field contract + security notes:
 [`docs/onboarding-design.md`](docs/onboarding-design.md).
 
-**Whether closing your session stops `start` depends on how it was launched.** Run directly in
-a bare interactive terminal, closing that terminal sends `SIGHUP` and it exits like any other
-foreground process. Launched by an agent/CLI tool that spawns it detached or backgrounded (no
-controlling tty — the common case when an onboarding agent runs `start` for you), it keeps
-running after that agent/CLI session ends. Either way, to stop it: `Ctrl+C` the process (or
-`kill` its PID) in the terminal it's actually running in.
+**Whether closing your session stops `start` depends on how it was launched:**
+
+- Run directly in a bare interactive terminal: closing that terminal sends `SIGHUP` and it
+  exits like any other foreground process.
+- Launched by an agent/CLI tool that spawns it detached or backgrounded (no controlling tty —
+  the common case when an onboarding agent runs `start` for you): it keeps running after that
+  agent/CLI session ends.
+
+Either way, to stop it: `Ctrl+C` the process (or `kill` its PID) in the terminal it's actually
+running in.
 
 ### Running as a persistent service (optional)
 
@@ -94,16 +98,16 @@ a process manager instead of a bare foreground shell. **This is optional and cha
 state (a boot-persistent service) — ask the user before setting it up; don't do it silently as
 part of the default init/start flow.**
 
-systemd (user service, survives reboot with `loginctl enable-linger`):
+systemd (user service):
 
 ```bash
-mkdir -p ~/.config/systemd/user
+mkdir -p ~/.config/systemd/user ~/.codex-openmax
 cat > ~/.config/systemd/user/codex-openmax.service <<'UNIT'
 [Unit]
 Description=codex-openmax adapter
 
 [Service]
-WorkingDirectory=%h/path/to/your/config-dir
+WorkingDirectory=%h/.codex-openmax
 ExecStart=codex-openmax start
 Restart=on-failure
 
@@ -112,7 +116,14 @@ WantedBy=default.target
 UNIT
 systemctl --user daemon-reload
 systemctl --user enable --now codex-openmax
-loginctl enable-linger "$USER"   # keep the user service running across reboots/logout
+```
+
+To survive reboot/logout (not just this login session), a user service also needs linger
+enabled — this is a system-level change (affects this Linux user account beyond the service
+itself), so confirm with the user before running it:
+
+```bash
+loginctl enable-linger "$USER"
 ```
 
 pm2:
