@@ -10,6 +10,13 @@
 // same flow the platform's default "zylos" agent type already uses for self-onboarding.)
 // Header/endpoint shapes pinned from the SDK's TokenManager + a live check.
 // fetch is injected for tests; node 20 global fetch in production.
+//
+// CF-Access: on a CF-gated deployment (e.g. cws-int), every request below needs
+// CF-Access-Client-Id/Secret or Cloudflare Access rejects it before it ever reaches
+// cws-core — unrelated to cws-core auth. Reused from the SDK's own cfAccessHeaders()
+// (reads COCO_CF_ACCESS_CLIENT_ID/SECRET from env; {} when unset, so it's safe to
+// spread unconditionally on unprotected deployments too).
+import { cfAccessHeaders } from "@openmaxai/openmax-agent-sdk";
 
 export type FetchLike = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<{
 	ok: boolean;
@@ -23,7 +30,7 @@ export type FetchLike = (url: string, init?: { method?: string; headers?: Record
 async function postJson(fetchFn: FetchLike, url: string, label: string, body: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {
 	const res = await fetchFn(url, {
 		method: "POST",
-		headers: { "content-type": "application/json", ...headers },
+		headers: { "content-type": "application/json", ...cfAccessHeaders(), ...headers },
 		body: JSON.stringify(body),
 	});
 	const text = await res.text();
@@ -110,7 +117,7 @@ export interface SelfInfo {
 
 /** GET /api/v1/me with the org JWT — hydrates the config's org.self block. */
 export async function fetchSelf(fetchFn: FetchLike, bffUrl: string, jwt: string): Promise<SelfInfo> {
-	const res = await fetchFn(`${bffUrl}/api/v1/me`, { method: "GET", headers: { authorization: `Bearer ${jwt}` } });
+	const res = await fetchFn(`${bffUrl}/api/v1/me`, { method: "GET", headers: { authorization: `Bearer ${jwt}`, ...cfAccessHeaders() } });
 	const text = await res.text();
 	if (!res.ok) throw new Error(`/api/v1/me → HTTP ${res.status}`);
 	const o = JSON.parse(text) as { data?: Record<string, unknown> };

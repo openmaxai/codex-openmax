@@ -38,6 +38,36 @@ describe("onboarding: token exchange + self hydration", () => {
 		expect("org_id" in body).toBe(false);
 	});
 
+	it("KILLING: CF-Access headers (COCO_CF_ACCESS_CLIENT_ID/SECRET) are attached to every onboarding request — CF-gated deployments (e.g. cws-int) 403 at the Access layer without them, before ever reaching cws-core", async () => {
+		const prevId = process.env.COCO_CF_ACCESS_CLIENT_ID;
+		const prevSecret = process.env.COCO_CF_ACCESS_CLIENT_SECRET;
+		process.env.COCO_CF_ACCESS_CLIENT_ID = "cf_id_1";
+		process.env.COCO_CF_ACCESS_CLIENT_SECRET = "cf_secret_1";
+		try {
+			const { fetchFn: postFetch, calls: postCalls } = fakeFetch([{ match: "/auth/agent/token", data: { access_token: "jwt_1" } }]);
+			await exchangeAgentToken(postFetch, "https://x.test", "sk", "org_1");
+			expect(postCalls[0].headers?.["CF-Access-Client-Id"]).toBe("cf_id_1");
+			expect(postCalls[0].headers?.["CF-Access-Client-Secret"]).toBe("cf_secret_1");
+
+			const { fetchFn: getFetch, calls: getCalls } = fakeFetch([{ match: "/api/v1/me", data: { member_id: "m_9", display_name: "codex-bot" } }]);
+			await fetchSelf(getFetch, "https://x.test", "jwt_1");
+			expect(getCalls[0].headers?.["CF-Access-Client-Id"]).toBe("cf_id_1");
+			expect(getCalls[0].headers?.["CF-Access-Client-Secret"]).toBe("cf_secret_1");
+		} finally {
+			if (prevId === undefined) delete process.env.COCO_CF_ACCESS_CLIENT_ID;
+			else process.env.COCO_CF_ACCESS_CLIENT_ID = prevId;
+			if (prevSecret === undefined) delete process.env.COCO_CF_ACCESS_CLIENT_SECRET;
+			else process.env.COCO_CF_ACCESS_CLIENT_SECRET = prevSecret;
+		}
+	});
+
+	it("KILLING: no CF-Access env set -> no CF-Access-Client-Id/Secret headers at all (unprotected deployments unaffected)", async () => {
+		const { fetchFn, calls } = fakeFetch([{ match: "/auth/agent/token", data: { access_token: "jwt_1" } }]);
+		await exchangeAgentToken(fetchFn, "https://x.test", "sk", "org_1");
+		expect(calls[0].headers?.["CF-Access-Client-Id"]).toBeUndefined();
+		expect(calls[0].headers?.["CF-Access-Client-Secret"]).toBeUndefined();
+	});
+
 	it("HTTP-error messages use the endpoint LABEL, not the raw URL (postJson redaction — defensive: keeps any future id-bearing URL out of user-visible errors)", async () => {
 		const { fetchFn } = fakeFetch([{ match: "/auth/agent/token", status: 401, raw: JSON.stringify({ message: "bad key" }) }]);
 		const err = await exchangeAgentToken(fetchFn, "https://secret-host.test", "sk", "org_1").catch((e: Error) => e);
