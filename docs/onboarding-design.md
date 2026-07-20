@@ -1,41 +1,52 @@
-# P2-① — Generated onboarding prompt + `init`/`start` CLI
+# P2-① — `init`/`start` CLI (onboarding mechanical layer)
 
 Decision (owner, 2026-07-17): the **primary user path** for connecting a Codex agent to
 OpenMax is a **config-embedded generated prompt** — the workspace renders a prompt with all
 connection material inlined; the user pastes the whole block into their Codex; Codex (the
 agent itself) installs this package, writes its config, starts the service and reports
-"online". Zero interactive input. The CLI (`init`/`start`) is the **mechanical layer** the
-prompt drives; humans can also call it directly.
+"online". Zero interactive input. **This repo owns the CLI (`init`/`start`) mechanical layer
+the prompt drives; the workspace product owns rendering the prompt itself** (owner, 2026-07-20).
+Humans can also call the CLI directly.
 
-Validated by the 2026-07-17 live onboarding: a fully-inlined config block (org_id,
-invitation id, token, URLs) was pasted to this agent and the stack came up with zero
-follow-up questions.
+**Credential form — corrected after live testing (2026-07-20).** The prompt embeds a
+provisioned agent **`api_key` + `identity_id`**, NOT an invitation to redeem. Live testing
+against the box org proved `/api/v1/invitations/{id}/accept` is a **human-only** flow: an
+unauthenticated call 401s, and an authenticated agent JWT is rejected
+`MEMBER_INVALID_AGENT_OWNER: new owner must be an active human member`. So a Codex agent can
+never self-redeem an invitation. The platform side ("Add Codex agent", where the human is
+already logged in) provisions the api_key and embeds it in the rendered prompt — matching the
+SDK README's "dashboard/api-key provisioning" being platform-owned. The 07-17 "embed
+invitation token → agent self-redeems" framing was the untested assumption this replaces; the
+api_key path is verified working end-to-end (init → JWT via Bearer → /me hydration → config).
 
 ## Components
 
 | Piece | Where | Role |
 |-------|-------|------|
-| Prompt template | `templates/onboarding-prompt.md` | Rendered by the platform (workspace "Add Codex agent" flow, luna/gavin's side); placeholders `{{…}}` |
-| `codex-openmax init` | `src/cli.ts` | Non-interactive: consume connection material → (redeem invitation → api key) → write `config.json` → validate `codex` binary present |
+| `codex-openmax init` | `src/cli.ts` | Non-interactive: consume connection material (api_key + identity_id) → exchange JWT → hydrate self → write `config.json` → preflight `codex` binary |
 | `codex-openmax start` | `src/cli.ts` | Productized `scripts/live-roundtrip.ts`: construct the real `CwsAgentBridge` from `config.json`, run `main()`, keep alive; `--daemon` mode later |
+
+**The onboarding prompt is rendered by the OpenMax workspace product, not this repo** (owner
+call, 2026-07-20). This repo owns only the CLI mechanical layer; the platform owns generating
+the paste-ready prompt. What the platform must embed in that prompt = exactly `init`'s
+`--stdin-json` contract below (`bff_url`, `ws_url`, `org_id`, `api_key`, `identity_id`, optional
+`local_http_port`), plus the security requirement that the api_key is a long-lived credential:
+warn the user not to forward the prompt, and instruct the agent never to echo the key back.
 
 ## `init` contract (non-interactive, idempotent)
 
-Input precedence: flags → `--stdin-json` (single JSON blob, what the prompt uses) →
-environment. Required material: `bff_url`, `ws_url`, `org_id`, and EITHER
-(`invitation_id` + `invitation_token`) OR a ready `api_key` (+ `identity_id`).
+Reads one JSON blob on stdin (`--stdin-json`, what the prompt uses). Required:
+`bff_url`, `ws_url`, `org_id`, `api_key`, `identity_id`. Optional: `local_http_port`.
 
 Steps:
-1. If invitation material given: redeem → obtain `identity_id` + `api_key`.
-   *Implementation note: verify the redemption endpoint against the platform/SDK docs at
-   implementation time (the 07-17 manual run used the invitation flow successfully; pin
-   the exact endpoint + payload from the SDK/onboarding docs, do NOT guess).*
-2. Hydrate org block (`self` member_id / display_name, `owner`) from the platform
-   (`/api/v1/…` with the fresh JWT) — same material `config.json` carries today.
-3. Write `config.json` (0600). Never echo `api_key`/token back to stdout — print a
-   fingerprint (`…last4`) only.
-4. Preflight: `codex --version` ≥ minimum; warn (not fail) if missing — `start` hard-fails.
-5. Exit 0 with a one-line machine-readable summary (`{"ok":true,"org":"…","self":"…"}`).
+1. Validate all required fields present (before any network call).
+2. Exchange the org JWT: `POST /auth/agent/token {org_id}` with `Authorization: Bearer <api_key>`
+   (the shape the SDK's TokenManager sends and cws-core reads — verified live).
+3. Hydrate the org `self` block (member_id / display_name) from `GET /api/v1/me` with the JWT.
+4. Write `config.json` at a guaranteed `0600` (temp-file + explicit chmod + atomic rename).
+   Never echo the api_key: the success line carries only org id + display name.
+5. Preflight: `codex --version`; warn (not fail) if missing — `start` hard-fails.
+6. Exit 0 with a one-line machine-readable summary (`{"ok":true,"org":"…","self":"…","codex":…}`).
 
 ## `start` contract
 
@@ -46,14 +57,15 @@ Steps:
    Codex to report back.
 4. Signal handling: SIGINT/SIGTERM → graceful stop (bridge.stop + server close).
 
-## Security posture (from the 07-17 decision, verbatim requirements)
+## Security posture
 
-- The rendered prompt **contains a one-time invitation credential** — it IS an invite
-  link. Template carries a visible warning: *do not forward/publish; the token is
-  single-use and expiring.*
-- The prompt instructs Codex to **never echo the token** in its replies (report success
-  by org/display-name only).
-- `config.json` is written 0600 and gitignored (already is).
+- The embedded `api_key` is a **long-lived credential** — the platform-rendered prompt must
+  warn the user not to forward/screenshot it, and instruct the agent never to echo it (report
+  success by org/display-name only). `init`'s success line and all error messages are already
+  key-free (errors carry endpoint labels, never raw URLs/values).
+- `config.json` is written `0600` and gitignored (already is), guaranteed even when
+  overwriting an existing file or when a loose temp file pre-exists (temp + chmod + atomic
+  rename — see `writeConfigFile`).
 
 ## Non-goals (this PR)
 

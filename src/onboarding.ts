@@ -34,38 +34,6 @@ async function postJson(fetchFn: FetchLike, url: string, label: string, body: un
 	return (typeof o.data === "object" && o.data !== null ? o.data : o) as Record<string, unknown>;
 }
 
-export interface RedeemResult {
-	identityId: string;
-	apiKey: string;
-	memberId?: string;
-	displayName?: string;
-}
-
-/** POST /api/v1/invitations/{id}/accept {token} — the token IS the credential (no auth header).
- * Field names follow the platform's snake_case; fail loudly listing received keys (never values)
- * if the shape drifts, so a contract change surfaces as an actionable error, not a bad config. */
-export async function redeemInvitation(
-	fetchFn: FetchLike,
-	bffUrl: string,
-	invitationId: string,
-	token: string,
-): Promise<RedeemResult> {
-	const data = await postJson(fetchFn, `${bffUrl}/api/v1/invitations/${invitationId}/accept`, "invitation accept (/api/v1/invitations/…/accept)", { token });
-	const identityId = data.identity_id ?? data.identityId;
-	const apiKey = data.api_key ?? data.apiKey;
-	if (typeof identityId !== "string" || typeof apiKey !== "string") {
-		throw new Error(`invitation accepted but response lacks identity_id/api_key (got keys: ${Object.keys(data).join(", ")})`);
-	}
-	const memberId = data.member_id ?? data.memberId;
-	const displayName = data.display_name ?? data.displayName;
-	return {
-		identityId,
-		apiKey,
-		...(typeof memberId === "string" ? { memberId } : {}),
-		...(typeof displayName === "string" ? { displayName } : {}),
-	};
-}
-
 /** POST /auth/agent/token {org_id} with `Authorization: Bearer <api_key>` — the shape the
  * SDK's own TokenManager sends (transport/token.js) and cws-core reads; pinned by 0t's R1
  * against SDK contract auth-lifecycle.md (the live logs showed URL+body only, headers were
@@ -101,28 +69,24 @@ export interface OnboardInput {
 	bff_url: string;
 	ws_url: string;
 	org_id: string;
-	invitation_id?: string;
-	invitation_token?: string;
-	api_key?: string;
-	identity_id?: string;
+	// The onboarding credential is a provisioned agent api_key + identity_id. There is NO
+	// agent-driven invitation redemption: live testing (2026-07-20) confirmed
+	// /api/v1/invitations/{id}/accept is a HUMAN-only flow — an authenticated agent JWT is
+	// rejected `MEMBER_INVALID_AGENT_OWNER: new owner must be an active human member`, and an
+	// unauthenticated call 401s. The platform ("Add Codex agent", human already logged in)
+	// provisions the api_key and embeds it in the generated prompt.
+	api_key: string;
+	identity_id: string;
 	local_http_port?: number;
 }
 
 /** Full init pipeline → the config.json object (same shape the P1 stack already runs on). */
 export async function buildConfig(fetchFn: FetchLike, input: OnboardInput): Promise<Record<string, unknown>> {
-	let apiKey = input.api_key;
-	let identityId = input.identity_id;
-	if (apiKey) {
-		// Direct-key path: identity_id is REQUIRED (config.ts validation demands cws.identityId;
-		// a config without it would be written here only to be rejected by `start`). Validated
-		// before any network call.
-		if (!identityId) throw new Error("api_key path requires identity_id (start's config validation demands it)");
-	} else {
-		if (!input.invitation_id || !input.invitation_token) throw new Error("need invitation_id+invitation_token or api_key");
-		const redeemed = await redeemInvitation(fetchFn, input.bff_url, input.invitation_id, input.invitation_token);
-		apiKey = redeemed.apiKey;
-		identityId = redeemed.identityId;
-	}
+	const { api_key: apiKey, identity_id: identityId } = input;
+	// Validate before any network call (config.ts demands cws.identityId; a config missing it
+	// would be written only for `start` to reject it).
+	if (!apiKey) throw new Error("missing required field: api_key");
+	if (!identityId) throw new Error("missing required field: identity_id");
 	const jwt = await exchangeAgentToken(fetchFn, input.bff_url, apiKey, input.org_id);
 	const self = await fetchSelf(fetchFn, input.bff_url, jwt);
 	return {

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildConfig, exchangeAgentToken, fetchSelf, redeemInvitation, writeConfigFile, type FetchLike } from "../src/onboarding.js";
+import { buildConfig, exchangeAgentToken, fetchSelf, writeConfigFile, type FetchLike } from "../src/onboarding.js";
 
 /** Scripted fetch: match by URL substring, record calls (headers/body) for assertions. */
 function fakeFetch(routes: Array<{ match: string; status?: number; data?: unknown; raw?: string }>) {
@@ -21,37 +21,6 @@ function fakeFetch(routes: Array<{ match: string; status?: number; data?: unknow
 	return { fetchFn, calls };
 }
 
-describe("onboarding: invitation redemption", () => {
-	it("posts the token to /api/v1/invitations/{id}/accept and unwraps identity/api key", async () => {
-		const { fetchFn, calls } = fakeFetch([
-			{ match: "/invitations/inv_1/accept", data: { identity_id: "id_1", api_key: "sk_test", member_id: "m_1" } },
-		]);
-		const r = await redeemInvitation(fetchFn, "https://x.test", "inv_1", "tok_1");
-		expect(r).toEqual({ identityId: "id_1", apiKey: "sk_test", memberId: "m_1" });
-		expect(calls[0].url).toBe("https://x.test/api/v1/invitations/inv_1/accept");
-		expect(JSON.parse(calls[0].body!)).toEqual({ token: "tok_1" });
-		expect(calls[0].headers?.authorization).toBeUndefined(); // the token IS the credential
-	});
-
-	it("KILLING: contract drift (accepted but no api_key) fails loudly with key names, never silently mis-configures", async () => {
-		const { fetchFn } = fakeFetch([{ match: "/accept", data: { identity_id: "id_1", something_else: "x" } }]);
-		await expect(redeemInvitation(fetchFn, "https://x.test", "inv_1", "t")).rejects.toThrow(/identity_id\/api_key.*something_else/s);
-	});
-
-	it("HTTP error surfaces status + server message (no retry, no secret echo)", async () => {
-		const { fetchFn } = fakeFetch([{ match: "/accept", status: 410, raw: JSON.stringify({ message: "invitation expired" }) }]);
-		await expect(redeemInvitation(fetchFn, "https://x.test", "inv_1", "t")).rejects.toThrow(/410.*invitation expired/);
-	});
-
-	it("KILLING (0t R1 P2): failure errors NEVER contain the invitation id — the prompt tells users to paste errors back", async () => {
-		const { fetchFn } = fakeFetch([{ match: "/accept", status: 410, raw: JSON.stringify({ message: "invitation expired" }) }]);
-		const err = await redeemInvitation(fetchFn, "https://x.test", "inv_SECRET_1234", "tok").catch((e: Error) => e);
-		expect(err).toBeInstanceOf(Error);
-		expect((err as Error).message).not.toContain("inv_SECRET_1234");
-		expect((err as Error).message).not.toContain("tok");
-	});
-});
-
 describe("onboarding: token exchange + self hydration", () => {
 	it("KILLING (0t R1 P1): exchanges org JWT via `Authorization: Bearer <api_key>` — the SDK TokenManager/cws-core contract shape, NOT x-api-key", async () => {
 		const { fetchFn, calls } = fakeFetch([{ match: "/auth/agent/token", data: { access_token: "jwt_1" } }]);
@@ -61,6 +30,13 @@ describe("onboarding: token exchange + self hydration", () => {
 		expect(JSON.parse(calls[0].body!)).toEqual({ org_id: "org_1" });
 	});
 
+	it("HTTP-error messages use the endpoint LABEL, not the raw URL (postJson redaction — defensive: keeps any future id-bearing URL out of user-visible errors)", async () => {
+		const { fetchFn } = fakeFetch([{ match: "/auth/agent/token", status: 401, raw: JSON.stringify({ message: "bad key" }) }]);
+		const err = await exchangeAgentToken(fetchFn, "https://secret-host.test", "sk", "org_1").catch((e: Error) => e);
+		expect((err as Error).message).toContain("agent token exchange");
+		expect((err as Error).message).not.toContain("https://secret-host.test");
+	});
+
 	it("fetchSelf reads /api/v1/me with Bearer and maps member_id/display_name", async () => {
 		const { fetchFn, calls } = fakeFetch([{ match: "/api/v1/me", data: { member_id: "m_9", display_name: "codex-bot" } }]);
 		expect(await fetchSelf(fetchFn, "https://x.test", "jwt_1")).toEqual({ memberId: "m_9", displayName: "codex-bot" });
@@ -68,31 +44,13 @@ describe("onboarding: token exchange + self hydration", () => {
 	});
 });
 
-describe("onboarding: buildConfig pipeline", () => {
+describe("onboarding: buildConfig pipeline (api_key + identity_id)", () => {
 	const ROUTES = [
-		{ match: "/invitations/inv_1/accept", data: { identity_id: "id_1", api_key: "sk_new" } },
 		{ match: "/auth/agent/token", data: { access_token: "jwt_1" } },
 		{ match: "/api/v1/me", data: { member_id: "m_9", display_name: "codex-bot" } },
 	];
 
-	it("invitation path: redeem -> exchange -> hydrate -> config shape the P1 stack runs on", async () => {
-		const { fetchFn } = fakeFetch(ROUTES);
-		const cfg = await buildConfig(fetchFn, {
-			bff_url: "https://x.test",
-			ws_url: "wss://x.test/ws",
-			org_id: "org_1",
-			invitation_id: "inv_1",
-			invitation_token: "tok_1",
-		});
-		expect(cfg).toEqual({
-			cws: { bffUrl: "https://x.test", wsUrl: "wss://x.test/ws", identityId: "id_1", apiKey: "sk_new" },
-			codex: { bin: "codex", cwd: "." },
-			bridge: { localHttpPort: 8787 },
-			org: { org_id: "org_1", self: { member_id: "m_9", display_name: "codex-bot" }, access: { dmPolicy: "open" } },
-		});
-	});
-
-	it("api_key path (with required identity_id) skips redemption entirely; custom port honored; config carries identityId", async () => {
+	it("exchange -> hydrate -> config shape the P1 stack runs on; no redemption endpoint touched", async () => {
 		const { fetchFn, calls } = fakeFetch(ROUTES);
 		const cfg = await buildConfig(fetchFn, {
 			bff_url: "https://x.test",
@@ -102,24 +60,34 @@ describe("onboarding: buildConfig pipeline", () => {
 			identity_id: "id_direct",
 			local_http_port: 9999,
 		});
-		expect(cfg.cws).toEqual({ bffUrl: "https://x.test", wsUrl: "wss://x.test/ws", identityId: "id_direct", apiKey: "sk_direct" });
-		expect((cfg.bridge as { localHttpPort: number }).localHttpPort).toBe(9999);
-		expect(calls.some((c) => c.url.includes("/accept"))).toBe(false);
+		expect(cfg).toEqual({
+			cws: { bffUrl: "https://x.test", wsUrl: "wss://x.test/ws", identityId: "id_direct", apiKey: "sk_direct" },
+			codex: { bin: "codex", cwd: "." },
+			bridge: { localHttpPort: 9999 },
+			org: { org_id: "org_1", self: { member_id: "m_9", display_name: "codex-bot" }, access: { dmPolicy: "open" } },
+		});
+		expect(calls.some((c) => c.url.includes("/accept"))).toBe(false); // no agent-side invitation redemption exists
 	});
 
-	it("KILLING (0t R1 P2): api_key WITHOUT identity_id is rejected before any network call — start's validation would refuse the config", async () => {
+	it("default port when omitted", async () => {
+		const { fetchFn } = fakeFetch(ROUTES);
+		const cfg = await buildConfig(fetchFn, { bff_url: "https://x.test", ws_url: "wss://x.test/ws", org_id: "org_1", api_key: "sk", identity_id: "id" });
+		expect((cfg.bridge as { localHttpPort: number }).localHttpPort).toBe(8787);
+	});
+
+	it("KILLING: missing api_key -> hard error before any network call", async () => {
 		const { fetchFn, calls } = fakeFetch(ROUTES);
 		await expect(
-			buildConfig(fetchFn, { bff_url: "https://x.test", ws_url: "wss://x.test/ws", org_id: "org_1", api_key: "sk_direct" }),
-		).rejects.toThrow(/identity_id/);
+			buildConfig(fetchFn, { bff_url: "https://x.test", ws_url: "wss://x.test/ws", org_id: "org_1", identity_id: "id" } as never),
+		).rejects.toThrow(/api_key/);
 		expect(calls).toHaveLength(0);
 	});
 
-	it("KILLING: neither invitation nor api_key -> hard error before any network call", async () => {
+	it("KILLING (0t R1 P2): missing identity_id -> rejected before any network call (start's validation would refuse the config)", async () => {
 		const { fetchFn, calls } = fakeFetch(ROUTES);
 		await expect(
-			buildConfig(fetchFn, { bff_url: "https://x.test", ws_url: "wss://x.test/ws", org_id: "org_1" }),
-		).rejects.toThrow(/invitation_id\+invitation_token or api_key/);
+			buildConfig(fetchFn, { bff_url: "https://x.test", ws_url: "wss://x.test/ws", org_id: "org_1", api_key: "sk" } as never),
+		).rejects.toThrow(/identity_id/);
 		expect(calls).toHaveLength(0);
 	});
 });

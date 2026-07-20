@@ -32,7 +32,7 @@ async function cmdInit(args: string[]): Promise<void> {
 		console.error("init: stdin is not valid JSON");
 		process.exit(1);
 	}
-	for (const f of ["bff_url", "ws_url", "org_id"] as const) {
+	for (const f of ["bff_url", "ws_url", "org_id", "api_key", "identity_id"] as const) {
 		if (typeof input[f] !== "string" || !input[f]) {
 			console.error(`init: missing required field "${f}"`);
 			process.exit(1);
