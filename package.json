@@ -24,9 +24,8 @@
 		"typescript": "^5.5.0",
 		"vitest": "^2.0.0"
 	},
-	"comment": "Layer 1 will depend on @openmaxai/cws-agent-sdk once SDK v0 is published; bridge/ mocks it until then (see docs).",
 	"dependencies": {
-		"@openmaxai/openmax-agent-sdk": "^0.1.0-alpha.2"
+		"@openmaxai/openmax-agent-sdk": "^1.0.1"
 	},
 	"bin": {
 		"codex-openmax": "dist/cli.js"

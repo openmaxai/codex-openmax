@@ -1,6 +1,6 @@
 // Contract conformance against the canonical cws-comm protocol contract.
-// Fixtures are vendored VERBATIM from @openmaxai/openmax-agent-sdk@0.1.0-alpha.2
-// fixtures/v1/ — the language-neutral golden corpus whose passing defines "protocol-conformant"
+// Fixtures are vendored VERBATIM from @openmaxai/openmax-agent-sdk fixtures/v1/ —
+// the language-neutral golden corpus whose passing defines "protocol-conformant"
 // (see that repo's CONTRACT.md). Re-vendor when the contract version bumps.
 // The canonical failureClass enum is read from the INSTALLED SDK's schema at test time, so a
 // contract bump that changes the enum fails here instead of drifting silently.

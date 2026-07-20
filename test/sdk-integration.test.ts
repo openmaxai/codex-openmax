@@ -1,5 +1,5 @@
 // REAL-SDK integration: my sdk-bridge adapter driven through the actual
-// @openmaxai/openmax-agent-sdk@0.1.0-alpha.0 CwsAgentBridge pipeline (no duck-type
+// @openmaxai/openmax-agent-sdk CwsAgentBridge pipeline (no duck-type
 // assumptions). Harness mirrors the SDK's own test/contract.test.js: injected fetch
 // routes the detail/conversation fetches, FakeWebSocket + urlProvider keep it hermetic,
 // injectFrame() drives the full dedupe → detail-fetch → hoist → conversation-fetch →
@@ -91,7 +91,7 @@ async function startRealBridge(fx: { org: { org_id: string }; frame: { payload: 
 	return { bridge, sdk: sdk!, inject: () => sdk!.injectFrame(fx.org.org_id, fx.frame) };
 }
 
-describe("REAL-SDK integration (CwsAgentBridge @0.1.0-alpha.2 → sdk-bridge → wake contract)", () => {
+describe("REAL-SDK integration (CwsAgentBridge → sdk-bridge → wake contract)", () => {
 	it("a DM frame through the REAL inbound pipeline reaches the wake handler as a contract-exact WakeRequest", async () => {
 		process.env.COCO_RPC_LOG = "0";
 		const fx = readJson(`${FIXTURES}/01-dm-open-basic.json`);
