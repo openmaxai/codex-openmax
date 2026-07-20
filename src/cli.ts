@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // codex-openmax CLI — the mechanical layer under the platform-rendered onboarding prompt
 // (docs/onboarding-design.md):
-//   init  — non-interactive: connection material (stdin JSON: bff_url/ws_url/org_id +
-//           provisioned api_key + identity_id) -> exchange JWT -> hydrate self ->
+//   init  — non-interactive: connection material (stdin JSON: bff_url/ws_url/org_id + EITHER
+//           a provisioned api_key + identity_id OR an invitation_id + invitation_token) ->
+//           exchange JWT (self-registering first if using an invitation) -> hydrate self ->
 //           write config.json (0600). Never echoes secrets.
 //   start — load config.json -> real SDK bridge -> main() (adapter server), foreground,
 //           graceful SIGINT/SIGTERM.
@@ -33,11 +34,17 @@ async function cmdInit(args: string[]): Promise<void> {
 		console.error("init: stdin is not valid JSON");
 		process.exit(1);
 	}
-	for (const f of ["bff_url", "ws_url", "org_id", "api_key", "identity_id"] as const) {
+	for (const f of ["bff_url", "ws_url", "org_id"] as const) {
 		if (typeof input[f] !== "string" || !input[f]) {
 			console.error(`init: missing required field "${f}"`);
 			process.exit(1);
 		}
+	}
+	const hasDirect = typeof input.api_key === "string" && !!input.api_key && typeof input.identity_id === "string" && !!input.identity_id;
+	const hasInvitation = typeof input.invitation_id === "string" && !!input.invitation_id && typeof input.invitation_token === "string" && !!input.invitation_token;
+	if (!hasDirect && !hasInvitation) {
+		console.error(`init: missing required fields — supply either ("api_key" + "identity_id") or ("invitation_id" + "invitation_token")`);
+		process.exit(1);
 	}
 	try {
 		const config = await buildConfig(globalThis.fetch as unknown as FetchLike, input);
