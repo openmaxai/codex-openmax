@@ -8,10 +8,11 @@ channel) to the OpenMax / CWS platform.
 
 ## Status
 
-**Alpha — published.** `@openmaxai/codex-openmax@0.1.0-alpha.0` is on npm. P1 MVP (the
+**Alpha — published** on npm (see the badge above for the current version). P1 MVP (the
 `/wake`+`/send` bridge, wake queue, SDK-backed CWS bridge) and P2-① (the `init`/`start`
-onboarding CLI) are shipped. Backed by the real `@openmaxai/openmax-agent-sdk`; verified with
-a live end-to-end round-trip against openmax.com.
+onboarding CLI, incl. self-register) are shipped. Backed by the real
+`@openmaxai/openmax-agent-sdk`; verified with a live end-to-end round-trip against
+openmax.com.
 
 ## What it is
 
@@ -78,6 +79,63 @@ api_key — direct-supplied or self-minted — is never echoed). `start` reads t
 connects the SDK bridge, and serves the adapter until `SIGINT`/`SIGTERM`. Requires the `codex`
 binary on `PATH`. Full field contract + security notes:
 [`docs/onboarding-design.md`](docs/onboarding-design.md).
+
+**Whether closing your session stops `start` depends on how it was launched:**
+
+- Run directly in a bare interactive terminal: closing that terminal sends `SIGHUP` and it
+  exits like any other foreground process.
+- Launched by an agent/CLI tool that spawns it detached or backgrounded (no controlling tty —
+  the common case when an onboarding agent runs `start` for you): it keeps running after that
+  agent/CLI session ends.
+
+Either way, to stop it: `Ctrl+C` the process (or `kill` its PID) in the terminal it's actually
+running in.
+
+### Running as a persistent service (optional)
+
+If you want `codex-openmax` to survive a reboot or keep running unattended, run `start` under
+a process manager instead of a bare foreground shell. **This is optional and changes system
+state (a boot-persistent service) — ask the user before setting it up; don't do it silently as
+part of the default init/start flow.**
+
+systemd (user service):
+
+```bash
+mkdir -p ~/.config/systemd/user ~/.codex-openmax
+cat > ~/.config/systemd/user/codex-openmax.service <<'UNIT'
+[Unit]
+Description=codex-openmax adapter
+
+[Service]
+WorkingDirectory=%h/.codex-openmax
+ExecStart=codex-openmax start
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable --now codex-openmax
+```
+
+To survive reboot/logout (not just this login session), a user service also needs linger
+enabled — this is a system-level change (affects this Linux user account beyond the service
+itself), so confirm with the user before running it:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+pm2:
+
+```bash
+pm2 start codex-openmax --name codex-openmax -- start
+pm2 save
+pm2 startup   # prints the command to enable pm2 itself on boot
+```
+
+Either way, run `codex-openmax init` once beforehand so `config.json` already exists in the
+working directory the service starts from.
 
 ## Layout
 
