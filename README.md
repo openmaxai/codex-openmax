@@ -8,10 +8,11 @@ channel) to the OpenMax / CWS platform.
 
 ## Status
 
-**Alpha — published.** `@openmaxai/codex-openmax@0.1.0-alpha.0` is on npm. P1 MVP (the
+**Alpha — published** on npm (see the badge above for the current version). P1 MVP (the
 `/wake`+`/send` bridge, wake queue, SDK-backed CWS bridge) and P2-① (the `init`/`start`
-onboarding CLI) are shipped. Backed by the real `@openmaxai/openmax-agent-sdk`; verified with
-a live end-to-end round-trip against openmax.com.
+onboarding CLI, incl. self-register) are shipped. Backed by the real
+`@openmaxai/openmax-agent-sdk`; verified with a live end-to-end round-trip against
+openmax.com.
 
 ## What it is
 
