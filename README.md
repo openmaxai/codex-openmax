@@ -80,10 +80,12 @@ connects the SDK bridge, and serves the adapter until `SIGINT`/`SIGTERM`. Requir
 binary on `PATH`. Full field contract + security notes:
 [`docs/onboarding-design.md`](docs/onboarding-design.md).
 
-**`start` is an independent process, not tied to your current shell session.** It keeps
-running after you close the terminal, CLI, or agent session you launched it from — closing
-that session does not stop the adapter. To stop it, `Ctrl+C` the process (or `kill` its PID)
-in the terminal it's actually running in.
+**Whether closing your session stops `start` depends on how it was launched.** Run directly in
+a bare interactive terminal, closing that terminal sends `SIGHUP` and it exits like any other
+foreground process. Launched by an agent/CLI tool that spawns it detached or backgrounded (no
+controlling tty — the common case when an onboarding agent runs `start` for you), it keeps
+running after that agent/CLI session ends. Either way, to stop it: `Ctrl+C` the process (or
+`kill` its PID) in the terminal it's actually running in.
 
 ### Running as a persistent service (optional)
 
