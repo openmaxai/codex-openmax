@@ -1,6 +1,7 @@
-// P2-① init plumbing: invitation redemption + org hydration (docs/onboarding-design.md).
-// Endpoints pinned from the installed SDK (services/core.js invitationAccept → apiPath
-// `/api/v1${p}`) and from the proven live-roundtrip logs (/auth/agent/token exchange).
+// P2-① init plumbing: JWT exchange + org self-hydration (docs/onboarding-design.md).
+// The onboarding credential is a platform-provisioned api_key + identity_id — there is NO
+// agent-side invitation redemption (live-tested 2026-07-20: /invitations/accept is
+// human-only). Header/endpoint shapes pinned from the SDK's TokenManager + a live check.
 // fetch is injected for tests; node 20 global fetch in production.
 
 export type FetchLike = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<{
@@ -10,8 +11,8 @@ export type FetchLike = (url: string, init?: { method?: string; headers?: Record
 }>;
 
 /** `label` is the REDACTED endpoint name used in every user-visible error — never the raw
- * URL: the invitation-accept URL embeds the invitation id, and the prompt contract promises
- * failures can be pasted back without leaking credential material. */
+ * URL. Defensive: no current endpoint embeds a secret in its URL, but the platform prompt
+ * invites users to paste failures back, so error text must never carry credential material. */
 async function postJson(fetchFn: FetchLike, url: string, label: string, body: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {
 	const res = await fetchFn(url, {
 		method: "POST",

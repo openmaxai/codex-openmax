@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-// codex-openmax CLI — the mechanical layer under the generated onboarding prompt
+// codex-openmax CLI — the mechanical layer under the platform-rendered onboarding prompt
 // (docs/onboarding-design.md):
-//   init  — non-interactive: connection material (stdin JSON) -> redeem invitation ->
-//           hydrate self -> write config.json (0600). Never echoes secrets.
+//   init  — non-interactive: connection material (stdin JSON: bff_url/ws_url/org_id +
+//           provisioned api_key + identity_id) -> exchange JWT -> hydrate self ->
+//           write config.json (0600). Never echoes secrets.
 //   start — load config.json -> real SDK bridge -> main() (adapter server), foreground,
 //           graceful SIGINT/SIGTERM.
 import { execFileSync } from "node:child_process";

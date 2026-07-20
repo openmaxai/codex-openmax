@@ -85,7 +85,7 @@ package to actually be on npm. Decisions (owner-agreed):
   `v*` tag → GitHub Actions → npm publish with provenance, gated on the protected
   `release` environment (human approval) and a tag-must-be-on-main ancestry check.
   One adaptation: a build step (this repo ships compiled `dist/`).
-- **Package payload** (`files`): `dist/`, `templates/`, `docs/`, README. `prepack`
+- **Package payload** (`files`): `dist/`, `docs/`, README. `prepack`
   runs the build so a stray manual `npm pack` can't ship stale artifacts.
 - **Versioning**: prerelease `0.1.0-alpha.N` while the platform-side prompt rendering
   is unshipped, mirroring the SDK's convention (and its dist-tag lesson: prereleases
