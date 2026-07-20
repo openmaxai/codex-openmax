@@ -8,7 +8,7 @@
 import { readFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { describe, it, expect } from "vitest";
-// @ts-expect-error — the alpha SDK ships no type declarations yet (plain JS/ESM)
+// (module declaration in src/openmax-agent-sdk.d.ts covers the untyped alpha SDK)
 import { CwsAgentBridge, CwsHttpClient } from "@openmaxai/openmax-agent-sdk";
 import { createSdkCwsBridge } from "../src/bridge/sdk-bridge.js";
 import type { WakeRequest, WakeResponse } from "../src/types.js";
