@@ -99,7 +99,8 @@ Steps — self-register shape (invitation_id + invitation_token, no pre-provisio
 ## Non-goals (this PR)
 
 - No platform-side rendering (that's the workspace flow, tracked with luna/gavin).
-- No daemonization/pm2 packaging (`start` runs foreground; supervisor integration later).
+- No daemonization/pm2 packaging (`start` runs foreground; supervisor integration later — README
+  documents an optional systemd/pm2 setup as a workaround in the meantime).
 - No ws/daemon transport (P2 item ② — codex 0.144.5's `app-server --listen ws://`).
 
 ## Distribution (added after owner review, 2026-07-20)

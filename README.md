@@ -79,6 +79,50 @@ connects the SDK bridge, and serves the adapter until `SIGINT`/`SIGTERM`. Requir
 binary on `PATH`. Full field contract + security notes:
 [`docs/onboarding-design.md`](docs/onboarding-design.md).
 
+**`start` is an independent process, not tied to your current shell session.** It keeps
+running after you close the terminal, CLI, or agent session you launched it from — closing
+that session does not stop the adapter. To stop it, `Ctrl+C` the process (or `kill` its PID)
+in the terminal it's actually running in.
+
+### Running as a persistent service (optional)
+
+If you want `codex-openmax` to survive a reboot or keep running unattended, run `start` under
+a process manager instead of a bare foreground shell. **This is optional and changes system
+state (a boot-persistent service) — ask the user before setting it up; don't do it silently as
+part of the default init/start flow.**
+
+systemd (user service, survives reboot with `loginctl enable-linger`):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/codex-openmax.service <<'UNIT'
+[Unit]
+Description=codex-openmax adapter
+
+[Service]
+WorkingDirectory=%h/path/to/your/config-dir
+ExecStart=codex-openmax start
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable --now codex-openmax
+loginctl enable-linger "$USER"   # keep the user service running across reboots/logout
+```
+
+pm2:
+
+```bash
+pm2 start codex-openmax --name codex-openmax -- start
+pm2 save
+pm2 startup   # prints the command to enable pm2 itself on boot
+```
+
+Either way, run `codex-openmax init` once beforehand so `config.json` already exists in the
+working directory the service starts from.
+
 ## Layout
 
 ```
