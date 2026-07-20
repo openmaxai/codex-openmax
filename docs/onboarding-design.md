@@ -8,37 +8,53 @@ agent itself) installs this package, writes its config, starts the service and r
 the prompt drives; the workspace product owns rendering the prompt itself** (owner, 2026-07-20).
 Humans can also call the CLI directly.
 
-**Credential form — corrected after live testing (2026-07-20).** The prompt embeds a
-provisioned agent **`api_key` + `identity_id`**, NOT an invitation to redeem. Live testing
-against the box org proved `/api/v1/invitations/{id}/accept` is a **human-only** flow: an
-unauthenticated call 401s, and an authenticated agent JWT is rejected
-`MEMBER_INVALID_AGENT_OWNER: new owner must be an active human member`. So a Codex agent can
-never self-redeem an invitation. The platform side ("Add Codex agent", where the human is
-already logged in) provisions the api_key and embeds it in the rendered prompt — matching the
-SDK README's "dashboard/api-key provisioning" being platform-owned. The 07-17 "embed
-invitation token → agent self-redeems" framing was the untested assumption this replaces; the
-api_key path is verified working end-to-end (init → JWT via Bearer → /me hydration → config).
+**Credential form — corrected again (2026-07-20), two supported shapes.** `init` now accepts
+either of two mutually-exclusive credential shapes:
+
+- **(a) direct** — a platform-provisioned agent **`api_key` + `identity_id`**, embedded as-is
+  by the "Add Codex agent" flow (human already logged in, platform provisions the key).
+- **(b) self-register** — an **`invitation_id` + `invitation_token`**. `init` redeems these
+  itself: `POST /auth/register/agent` (no auth) mints a fresh `identity_id` + `api_key` →
+  exchange an **identity-only** JWT (`POST /auth/agent/token` with the new api_key, `org_id`
+  omitted) → `POST /api/v1/invitations/{id}/accept` with that identity JWT and
+  `{"token": invitation_token}` → exchange an **org-scoped** JWT using the accept response's
+  `org_id` → hydrate `/api/v1/me`.
+
+An earlier version of this doc claimed step (b) was impossible — that reading a live
+401/`MEMBER_INVALID_AGENT_OWNER` response as "agent self-accept is human-only" was a
+misdiagnosis. cws-core's own tests (`TestAcceptInvitationSetsInviterAsAgentOwner`,
+`TestAcceptInvitationUsesRequestedOwnerOverInviter` in `internal/app/org/service_test.go`)
+confirm agent self-accept succeeds; `MEMBER_INVALID_AGENT_OWNER` fires only when the
+invitation's *resolved owner* field is itself invalid — unrelated to whether the acceptor is
+an agent. Live-tested end to end: `accept` returns 200 with `{member_id, org_id, role_slug}`
+for an agent-held identity JWT. This is the same self-register → identity JWT → accept → org
+JWT pattern the platform's default "zylos" agent type already uses to onboard itself
+(cws-core's `zylosInstallSpec` prompt template) — codex-openmax was the outlier, not the norm.
+Both shapes are verified working end-to-end and produce the identical `config.json`.
 
 ## Components
 
 | Piece | Where | Role |
 |-------|-------|------|
-| `codex-openmax init` | `src/cli.ts` | Non-interactive: consume connection material (api_key + identity_id) → exchange JWT → hydrate self → write `config.json` → preflight `codex` binary |
+| `codex-openmax init` | `src/cli.ts` | Non-interactive: consume connection material (direct api_key + identity_id, OR invitation_id + invitation_token to self-register) → exchange JWT → hydrate self → write `config.json` → preflight `codex` binary |
 | `codex-openmax start` | `src/cli.ts` | Productized `scripts/live-roundtrip.ts`: construct the real `CwsAgentBridge` from `config.json`, run `main()`, keep alive; `--daemon` mode later |
 
 **The onboarding prompt is rendered by the OpenMax workspace product, not this repo** (owner
 call, 2026-07-20). This repo owns only the CLI mechanical layer; the platform owns generating
 the paste-ready prompt. What the platform must embed in that prompt = exactly `init`'s
-`--stdin-json` contract below (`bff_url`, `ws_url`, `org_id`, `api_key`, `identity_id`, optional
-`local_http_port`), plus the security requirement that the api_key is a long-lived credential:
-warn the user not to forward the prompt, and instruct the agent never to echo the key back.
+`--stdin-json` contract below (`bff_url`, `ws_url`, `org_id`, plus EITHER `api_key` +
+`identity_id` OR `invitation_id` + `invitation_token`, optional `local_http_port`), plus the
+security requirement that the api_key (direct-supplied, or the one `init` mints for itself in
+the self-register path) is a long-lived credential: warn the user not to forward the prompt,
+and instruct the agent never to echo the key back.
 
 ## `init` contract (non-interactive, idempotent)
 
-Reads one JSON blob on stdin (`--stdin-json`, what the prompt uses). Required:
-`bff_url`, `ws_url`, `org_id`, `api_key`, `identity_id`. Optional: `local_http_port`.
+Reads one JSON blob on stdin (`--stdin-json`, what the prompt uses). Always required:
+`bff_url`, `ws_url`, `org_id`. Then EITHER `api_key` + `identity_id` (direct) OR
+`invitation_id` + `invitation_token` (self-register). Optional: `local_http_port`.
 
-Steps:
+Steps — direct shape:
 1. Validate all required fields present (before any network call).
 2. Exchange the org JWT: `POST /auth/agent/token {org_id}` with `Authorization: Bearer <api_key>`
    (the shape the SDK's TokenManager sends and cws-core reads — verified live).
@@ -47,6 +63,17 @@ Steps:
    Never echo the api_key: the success line carries only org id + display name.
 5. Preflight: `codex --version`; warn (not fail) if missing — `start` hard-fails.
 6. Exit 0 with a one-line machine-readable summary (`{"ok":true,"org":"…","self":"…","codex":…}`).
+
+Steps — self-register shape (invitation_id + invitation_token, no pre-provisioned credential):
+1. Validate all required fields present (before any network call).
+2. `POST /auth/register/agent` (no auth) → mint a fresh `identity_id` + `api_key`.
+3. Exchange an **identity-only** JWT: `POST /auth/agent/token {}` (no `org_id`) with
+   `Authorization: Bearer <new api_key>`.
+4. `POST /api/v1/invitations/{invitation_id}/accept` with that identity JWT and
+   `{"token": invitation_token}` → returns the authoritative `org_id` (+ member_id, role_slug).
+5. Exchange an **org-scoped** JWT using the same api_key and the accept response's `org_id`.
+6. Hydrate `self` from `GET /api/v1/me`, then write `config.json` exactly as in the direct
+   path (steps 4–6 above) — identical shape either way.
 
 ## `start` contract
 
@@ -59,10 +86,12 @@ Steps:
 
 ## Security posture
 
-- The embedded `api_key` is a **long-lived credential** — the platform-rendered prompt must
-  warn the user not to forward/screenshot it, and instruct the agent never to echo it (report
-  success by org/display-name only). `init`'s success line and all error messages are already
-  key-free (errors carry endpoint labels, never raw URLs/values).
+- The `api_key` — whether embedded directly or minted by `init` itself via self-register — is
+  a **long-lived credential**: the platform-rendered prompt must warn the user not to
+  forward/screenshot it, and the agent must never echo it (report success by org/display-name
+  only). `init`'s success line and all error messages are already key-free (errors carry
+  endpoint labels, never raw URLs/values), including errors from the self-register/accept
+  steps, which never leak the newly-minted api_key or the invitation_token.
 - `config.json` is written `0600` and gitignored (already is), guaranteed even when
   overwriting an existing file or when a loose temp file pre-exists (temp + chmod + atomic
   rename — see `writeConfigFile`).

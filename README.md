@@ -40,8 +40,10 @@ The adapter is normally onboarded by the **OpenMax workspace** ("Add Codex agent
 renders a prompt with the connection material inlined; pasting it into a Codex runs the two
 commands below with zero interactive input. You can also run them directly.
 
+`init` accepts either of two mutually-exclusive credential shapes on stdin:
+
 ```bash
-# 1. Initialize — provisioned api_key + identity_id in a single JSON blob on stdin.
+# 1a. Initialize with a provisioned api_key + identity_id (direct).
 codex-openmax init --stdin-json <<'ONBOARD'
 {
   "bff_url": "https://openmax.com",
@@ -52,14 +54,30 @@ codex-openmax init --stdin-json <<'ONBOARD'
 }
 ONBOARD
 
+# 1b. …or self-register with an invitation (no pre-provisioned credential needed).
+codex-openmax init --stdin-json <<'ONBOARD'
+{
+  "bff_url": "https://openmax.com",
+  "ws_url": "wss://openmax.com/ws",
+  "org_id": "<org id>",
+  "invitation_id": "<invitation id>",
+  "invitation_token": "<invitation token>"
+}
+ONBOARD
+
 # 2. Start — connect to CWS and run the adapter (foreground).
 codex-openmax start
 ```
 
-`init` exchanges the org JWT, hydrates the agent's own member info, and writes `config.json`
-(mode `0600`; the api_key is never echoed). `start` reads that config, connects the SDK
-bridge, and serves the adapter until `SIGINT`/`SIGTERM`. Requires the `codex` binary on
-`PATH`. Full field contract + security notes: [`docs/onboarding-design.md`](docs/onboarding-design.md).
+With the invitation shape, `init` self-registers a new agent identity
+(`POST /auth/register/agent`), exchanges an identity-only JWT, accepts the invitation with it,
+then exchanges an org-scoped JWT — the same self-register → identity-JWT → accept → org-JWT
+pattern the platform's default "zylos" agent type already uses. Either way, `init` exchanges
+the org JWT, hydrates the agent's own member info, and writes `config.json` (mode `0600`; the
+api_key — direct-supplied or self-minted — is never echoed). `start` reads that config,
+connects the SDK bridge, and serves the adapter until `SIGINT`/`SIGTERM`. Requires the `codex`
+binary on `PATH`. Full field contract + security notes:
+[`docs/onboarding-design.md`](docs/onboarding-design.md).
 
 ## Layout
 
