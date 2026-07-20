@@ -18,17 +18,72 @@
 // spread unconditionally on unprotected deployments too).
 import { cfAccessHeaders } from "@openmaxai/openmax-agent-sdk";
 
-export type FetchLike = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<{
+type FetchInit = { method?: string; headers?: Record<string, string>; body?: string; redirect?: "manual" | "follow" };
+export type FetchLike = (url: string, init?: FetchInit) => Promise<{
 	ok: boolean;
 	status: number;
+	headers?: { get(name: string): string | null };
 	text(): Promise<string>;
 }>;
+type FetchResponse = Awaited<ReturnType<FetchLike>>;
+
+// ── redirect handling (credential-leak guard, mirrors the SDK's TokenManager/CwsHttpClient
+// P1-C) ──────────────────────────────────────────────────────────────────────────────────
+// register/token/accept/me all carry a Bearer credential (api_key or JWT) to cws-core.
+// Native fetch auto-follows 3xx and RE-SENDS those headers to the redirect target — for a
+// cross-origin redirect that leaks the credential to a third party. We disable auto-follow
+// and refuse any hop that leaves the origin we started from.
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_REDIRECT_HOPS = 5;
+
+function safeOrigin(u: string): string {
+	try {
+		return new URL(u).origin;
+	} catch {
+		return u;
+	}
+}
+
+// Matches native fetch's method/body semantics per the WHATWG Fetch spec: 301/302 downgrade
+// POST->GET; 303 downgrades any non-GET/HEAD; 307/308 preserve method+body.
+function rewriteInitForRedirect(init: FetchInit, status: number): FetchInit {
+	const method = (init.method ?? "GET").toUpperCase();
+	const isGetOrHead = method === "GET" || method === "HEAD";
+	const downgradeToGet = (status === 303 && !isGetOrHead) || ((status === 301 || status === 302) && method === "POST");
+	if (!downgradeToGet) return init;
+	const { body: _body, ...rest } = init;
+	return { ...rest, method: "GET" };
+}
+
+async function fetchNoAutoFollow(fetchFn: FetchLike, url: string, init: FetchInit): Promise<FetchResponse> {
+	const startOrigin = safeOrigin(url);
+	let curUrl = url;
+	let curInit: FetchInit = { ...init, redirect: "manual" };
+	for (let hop = 0; ; hop++) {
+		const res = await fetchFn(curUrl, curInit);
+		if (!REDIRECT_STATUSES.has(res.status)) return res;
+		const loc = res.headers?.get("location") ?? res.headers?.get("Location") ?? null;
+		if (!loc) return res;
+		if (hop >= MAX_REDIRECT_HOPS) throw new Error(`too many redirects (>${MAX_REDIRECT_HOPS}) from ${url}`);
+		let nextUrl: string;
+		try {
+			nextUrl = new URL(loc, curUrl).toString();
+		} catch {
+			throw new Error(`invalid redirect Location "${loc}" from ${curUrl}`);
+		}
+		if (safeOrigin(nextUrl) !== startOrigin) {
+			throw new Error(`refusing cross-origin redirect to ${safeOrigin(nextUrl)} that would carry the auth credential (from ${startOrigin})`);
+		}
+		curUrl = nextUrl;
+		curInit = rewriteInitForRedirect(curInit, res.status);
+	}
+}
 
 /** `label` is the REDACTED endpoint name used in every user-visible error — never the raw
  * URL. Defensive: no current endpoint embeds a secret in its URL, but the platform prompt
  * invites users to paste failures back, so error text must never carry credential material. */
 async function postJson(fetchFn: FetchLike, url: string, label: string, body: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {
-	const res = await fetchFn(url, {
+	const res = await fetchNoAutoFollow(fetchFn, url, {
 		method: "POST",
 		headers: { "content-type": "application/json", ...cfAccessHeaders(), ...headers },
 		body: JSON.stringify(body),
@@ -117,7 +172,7 @@ export interface SelfInfo {
 
 /** GET /api/v1/me with the org JWT — hydrates the config's org.self block. */
 export async function fetchSelf(fetchFn: FetchLike, bffUrl: string, jwt: string): Promise<SelfInfo> {
-	const res = await fetchFn(`${bffUrl}/api/v1/me`, { method: "GET", headers: { authorization: `Bearer ${jwt}`, ...cfAccessHeaders() } });
+	const res = await fetchNoAutoFollow(fetchFn, `${bffUrl}/api/v1/me`, { method: "GET", headers: { authorization: `Bearer ${jwt}`, ...cfAccessHeaders() } });
 	const text = await res.text();
 	if (!res.ok) throw new Error(`/api/v1/me → HTTP ${res.status}`);
 	const o = JSON.parse(text) as { data?: Record<string, unknown> };

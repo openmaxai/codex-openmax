@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildConfig, exchangeAgentToken, fetchSelf, registerAgent, acceptInvitation, writeConfigFile, type FetchLike } from "../src/onboarding.js";
 
-/** Scripted fetch: match by URL substring, record calls (headers/body) for assertions. */
-function fakeFetch(routes: Array<{ match: string; status?: number; data?: unknown; raw?: string }>) {
+/** Scripted fetch: match by URL substring (checked in array order, first match wins — routes
+ * for a redirect's target URL must come before a broader route it would also match), record
+ * calls (headers/body) for assertions. `location` scripts a redirect response. */
+function fakeFetch(routes: Array<{ match: string; status?: number; data?: unknown; raw?: string; location?: string }>) {
 	const calls: Array<{ url: string; headers?: Record<string, string>; body?: string }> = [];
 	const fetchFn: FetchLike = async (url, init) => {
 		calls.push({ url, headers: init?.headers, body: init?.body });
@@ -15,6 +17,7 @@ function fakeFetch(routes: Array<{ match: string; status?: number; data?: unknow
 		return {
 			ok: status < 300,
 			status,
+			headers: { get: (name: string) => (name.toLowerCase() === "location" ? (r.location ?? null) : null) },
 			text: async () => r.raw ?? JSON.stringify({ $schema: "x", data: r.data, request_id: "r" }),
 		};
 	};
@@ -66,6 +69,24 @@ describe("onboarding: token exchange + self hydration", () => {
 		await exchangeAgentToken(fetchFn, "https://x.test", "sk", "org_1");
 		expect(calls[0].headers?.["CF-Access-Client-Id"]).toBeUndefined();
 		expect(calls[0].headers?.["CF-Access-Client-Secret"]).toBeUndefined();
+	});
+
+	it("KILLING (credential-leak guard, mirrors SDK P1-C): a SAME-origin redirect is followed transparently", async () => {
+		const { fetchFn, calls } = fakeFetch([
+			{ match: "/auth/agent/token/v2", data: { access_token: "jwt_1" } },
+			{ match: "/auth/agent/token", status: 302, location: "https://x.test/auth/agent/token/v2" },
+		]);
+		expect(await exchangeAgentToken(fetchFn, "https://x.test", "sk", "org_1")).toBe("jwt_1");
+		expect(calls).toHaveLength(2);
+		expect(calls[1].url).toBe("https://x.test/auth/agent/token/v2");
+	});
+
+	it("KILLING (credential-leak guard, mirrors SDK P1-C): a CROSS-origin redirect is refused — the Bearer api_key must never reach a third-party host", async () => {
+		const { fetchFn, calls } = fakeFetch([{ match: "/auth/agent/token", status: 302, location: "https://evil.test/steal" }]);
+		const err = await exchangeAgentToken(fetchFn, "https://x.test", "sk", "org_1").catch((e: Error) => e);
+		expect((err as Error).message).toContain("cross-origin redirect");
+		expect((err as Error).message).toContain("evil.test");
+		expect(calls).toHaveLength(1); // never followed to the malicious host
 	});
 
 	it("HTTP-error messages use the endpoint LABEL, not the raw URL (postJson redaction — defensive: keeps any future id-bearing URL out of user-visible errors)", async () => {
