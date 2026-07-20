@@ -3,7 +3,7 @@
 // from the repo root; credentials come from ./config.json (gitignored) — see config.example.json
 // plus an `org` block ({slug, org_id, self, owner, access}).
 import { readFileSync } from "node:fs";
-// @ts-expect-error — the alpha SDK ships no type declarations yet (plain JS/ESM)
+// (module declaration in src/openmax-agent-sdk.d.ts covers the untyped alpha SDK)
 import { CwsAgentBridge, CwsHttpClient, TokenManager, memoryStorage } from "@openmaxai/openmax-agent-sdk";
 import { createSdkCwsBridge } from "../src/bridge/sdk-bridge.js";
 import { main } from "../src/index.js";

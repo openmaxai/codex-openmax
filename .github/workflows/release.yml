@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Defense-in-depth: gate publishes behind a protected environment. Configure
+    # required reviewers + a deployment tag policy on the `release` environment
+    # (Settings > Environments) so every publish needs a human approval.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # required for npm provenance
+    steps:
+      # Actions pinned to full commit SHAs (not mutable @v4 tags): this is a
+      # privileged job (id-token: write + npm token), so the supply chain must
+      # be immutable. Bump SHAs via a reviewed PR.
+      - name: Checkout tagged commit (full history for ancestry check)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      # SECURITY GATE: only code that was merged through the protected-main
+      # review gate may be published. A v* tag on any other commit (e.g. an
+      # unmerged PR head, which can already carry a real version string) is
+      # refused here — the branch ruleset alone does NOT protect tags.
+      - name: Verify tagged commit is contained in protected main
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::Refusing to publish ${GITHUB_REF_NAME}: commit ${GITHUB_SHA} is NOT contained in protected origin/main. Only commits merged through the main review gate can be released."
+            exit 1
+          fi
+          echo "OK: ${GITHUB_SHA} is contained in protected main."
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (publish ships dist/)
+        run: npm run build
+
+      - name: Verify git tag matches package.json version
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "package.json=$PKG_VERSION  git tag=$TAG_VERSION"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag v$TAG_VERSION does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+
+      - name: Publish to npm
+        run: |
+          set -euo pipefail
+          PKG="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          # prerelease versions (contain a hyphen, e.g. 0.1.0-alpha.3) publish to
+          # the `alpha` dist-tag; stable versions publish to `latest`.
+          DIST_TAG="$(node -p "require('./package.json').version.includes('-') ? 'alpha' : 'latest'")"
+          echo "publishing $PKG@$VERSION with dist-tag: $DIST_TAG"
+          npm publish --provenance --access public --tag "$DIST_TAG"
+
+          # Pre-stable convenience: while NO stable (non-prerelease) version has
+          # ever been published, also point `latest` at each new prerelease. This
+          # keeps a bare `npm install $PKG` (no tag) resolving the newest alpha,
+          # instead of being stranded on the first-published version (npm forces
+          # `latest` onto the very first publish). As soon as a stable ships,
+          # `latest` tracks stable and prereleases stop touching it — so this
+          # block no-ops from then on.
+          if [ "$DIST_TAG" = "alpha" ]; then
+            HAS_STABLE="$(npm view "$PKG" versions --json 2>/dev/null \
+              | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{let vs;try{vs=JSON.parse(d)}catch{vs=[]};vs=Array.isArray(vs)?vs:[vs];process.stdout.write(vs.some(v=>!String(v).includes('-'))?'yes':'no')})")"
+            if [ "$HAS_STABLE" = "no" ]; then
+              echo "no stable published yet -> promoting latest -> $VERSION"
+              npm dist-tag add "$PKG@$VERSION" latest
+            else
+              echo "a stable version exists -> leaving latest untouched"
+            fi
+            echo "--- dist-tags now ---"
+            npm dist-tag ls "$PKG"
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
