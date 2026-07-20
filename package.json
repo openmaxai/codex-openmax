@@ -1,6 +1,6 @@
 {
 	"name": "@openmaxai/codex-openmax",
-	"version": "0.1.0-alpha.0",
+	"version": "0.1.0-alpha.1",
 	"private": false,
 	"description": "Codex CLI ⇆ OpenMax/CWS channel adapter (Category B): Layer 1 shared SDK bridge + Layer 2 runtime adapter.",
 	"repository": {
