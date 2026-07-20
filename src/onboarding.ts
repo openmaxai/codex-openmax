@@ -127,10 +127,12 @@ export interface OnboardInput {
 	bff_url: string;
 	ws_url: string;
 	org_id: string;
-	// Two mutually-exclusive credential shapes:
+	// Two credential shapes — direct takes priority when both are supplied:
 	//  (a) direct — a platform-provisioned agent api_key + identity_id, supplied as-is (the
-	//      "Add Codex agent" human-already-logged-in flow).
-	//  (b) self-register — an invitation_id + invitation_token. `buildConfig` self-registers a
+	//      "Add Codex agent" human-already-logged-in flow). Wins if any of api_key/identity_id
+	//      is present, even alongside an invitation_id/invitation_token.
+	//  (b) self-register — an invitation_id + invitation_token, used only when neither
+	//      api_key nor identity_id is present. `buildConfig` self-registers a
 	//      new agent identity (POST /auth/register/agent), exchanges an identity-only JWT,
 	//      accepts the invitation with it, then exchanges an org-scoped JWT using the same
 	//      api_key. Same self-register -> identity JWT -> accept -> org JWT pattern the
