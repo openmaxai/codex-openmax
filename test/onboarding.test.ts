@@ -96,6 +96,26 @@ describe("onboarding: token exchange + self hydration", () => {
 		expect((err as Error).message).not.toContain("https://secret-host.test");
 	});
 
+	it("KILLING: cws-core errors are RFC 9457 problem+json (`detail`/`code`, NOT `message`/`error`) — the real error text must survive, not just a bare HTTP status", async () => {
+		const { fetchFn } = fakeFetch([
+			{
+				match: "/invitations/inv_1/accept",
+				status: 409,
+				raw: JSON.stringify({ type: "https://git.coco.xyz/coco-workspace/cws-core/errors/MEMBER_INVALID_AGENT_OWNER", title: "Conflict", status: 409, detail: "new owner must be an active human member of the organization", code: "MEMBER_INVALID_AGENT_OWNER" }),
+			},
+		]);
+		const err = await acceptInvitation(fetchFn, "https://x.test", "identity_jwt", "inv_1", "tok").catch((e: Error) => e);
+		expect((err as Error).message).toContain("new owner must be an active human member");
+		expect((err as Error).message).toContain("MEMBER_INVALID_AGENT_OWNER");
+	});
+
+	it("KILLING: fetchSelf surfaces the real cws-core `detail` on error too, not just a bare HTTP status (it previously discarded the body entirely)", async () => {
+		const { fetchFn } = fakeFetch([{ match: "/api/v1/me", status: 403, raw: JSON.stringify({ detail: "org membership required", code: "ORG_MEMBERSHIP_REQUIRED" }) }]);
+		const err = await fetchSelf(fetchFn, "https://x.test", "jwt_1").catch((e: Error) => e);
+		expect((err as Error).message).toContain("org membership required");
+		expect((err as Error).message).toContain("ORG_MEMBERSHIP_REQUIRED");
+	});
+
 	it("fetchSelf reads /api/v1/me with Bearer and maps member_id/display_name", async () => {
 		const { fetchFn, calls } = fakeFetch([{ match: "/api/v1/me", data: { member_id: "m_9", display_name: "codex-bot" } }]);
 		expect(await fetchSelf(fetchFn, "https://x.test", "jwt_1")).toEqual({ memberId: "m_9", displayName: "codex-bot" });

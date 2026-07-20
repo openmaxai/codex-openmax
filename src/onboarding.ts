@@ -96,8 +96,15 @@ async function postJson(fetchFn: FetchLike, url: string, label: string, body: un
 		throw new Error(`${label} → HTTP ${res.status}, non-JSON body`);
 	}
 	if (!res.ok) {
-		const msg = (parsed as { message?: string; error?: string }).message ?? (parsed as { error?: string }).error ?? "";
-		throw new Error(`${label} → HTTP ${res.status}${msg ? `: ${msg}` : ""}`);
+		// cws-core errors are RFC 9457 problem+json — `detail` is the human-readable message,
+		// `code` a stable identifier (e.g. MEMBER_INVALID_AGENT_OWNER); there is NO `message` or
+		// `error` key. Those two are kept as a defensive fallback (matches the SDK's own
+		// `detail || error || message` priority) in case a non-cws-core hop in front (e.g. an
+		// edge proxy) ever returns a differently-shaped error body.
+		const p = parsed as { detail?: string; code?: string; message?: string; error?: string };
+		const msg = p.detail ?? p.error ?? p.message ?? "";
+		const code = p.code ? ` (${p.code})` : "";
+		throw new Error(`${label} → HTTP ${res.status}${msg ? `: ${msg}` : ""}${code}`);
 	}
 	// cws-core envelope: { $schema, data, request_id, ... } — unwrap when present.
 	const o = parsed as Record<string, unknown>;
@@ -174,7 +181,19 @@ export interface SelfInfo {
 export async function fetchSelf(fetchFn: FetchLike, bffUrl: string, jwt: string): Promise<SelfInfo> {
 	const res = await fetchNoAutoFollow(fetchFn, `${bffUrl}/api/v1/me`, { method: "GET", headers: { authorization: `Bearer ${jwt}`, ...cfAccessHeaders() } });
 	const text = await res.text();
-	if (!res.ok) throw new Error(`/api/v1/me → HTTP ${res.status}`);
+	if (!res.ok) {
+		// Same RFC 9457 problem+json shape as postJson's error path — see its comment for why
+		// `detail`/`code` (not `message`/`error`) are the real cws-core fields.
+		let p: { detail?: string; code?: string; message?: string; error?: string } = {};
+		try {
+			p = JSON.parse(text);
+		} catch {
+			// non-JSON body — fall through with an empty detail
+		}
+		const msg = p.detail ?? p.error ?? p.message ?? "";
+		const code = p.code ? ` (${p.code})` : "";
+		throw new Error(`/api/v1/me → HTTP ${res.status}${msg ? `: ${msg}` : ""}${code}`);
+	}
 	const o = JSON.parse(text) as { data?: Record<string, unknown> };
 	const d = (o.data ?? o) as Record<string, unknown>;
 	const memberId = d.member_id ?? d.id;
