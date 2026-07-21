@@ -227,7 +227,7 @@ export interface OnboardInput {
 
 /** Full init pipeline → the config.json object (same shape the P1 stack already runs on).
  * Dispatches on which credential shape `input` supplies — see OnboardInput. Validates fully
- * before any network call either way (config.ts demands cws.identityId; a config missing it
+ * before any network call either way (config.ts demands agent.identity_id; a config missing it
  * would be written only for `start` to reject it). */
 export async function buildConfig(fetchFn: FetchLike, input: OnboardInput): Promise<Record<string, unknown>> {
 	const { api_key: apiKey, identity_id: identityId, invitation_id: invitationId, invitation_token: invitationToken } = input;
@@ -241,16 +241,7 @@ export async function buildConfig(fetchFn: FetchLike, input: OnboardInput): Prom
 		if (!identityId) throw new Error("missing required field: identity_id");
 		const jwt = await exchangeAgentToken(fetchFn, input.bff_url, apiKey, input.org_id);
 		const self = await fetchSelf(fetchFn, input.bff_url, jwt);
-		return {
-			cws: { bffUrl: input.bff_url, wsUrl: input.ws_url, identityId, apiKey },
-			codex: { bin: "codex", cwd: "." },
-			bridge: { localHttpPort: input.local_http_port ?? 8787 },
-			org: {
-				org_id: input.org_id,
-				self: { member_id: self.memberId, display_name: self.displayName },
-				access: { dmPolicy: "open" },
-			},
-		};
+		return assembleConfig(input, identityId, apiKey, input.org_id, self);
 	}
 
 	// Self-register shape: register -> identity-only JWT -> accept invitation -> org JWT.
@@ -263,15 +254,39 @@ export async function buildConfig(fetchFn: FetchLike, input: OnboardInput): Prom
 	// caller-supplied input.org_id — trust the accept response over the reference value.
 	const orgJwt = await exchangeAgentToken(fetchFn, input.bff_url, registered.apiKey, accepted.orgId);
 	const self = await fetchSelf(fetchFn, input.bff_url, orgJwt);
+	return assembleConfig(input, registered.identityId, registered.apiKey, accepted.orgId, self);
+}
+
+/** Assemble the config.json object in the bridge / openmax-mirrored shape (see
+ * config.ts for the full field map), keeping the codex-openmax runtime-specific
+ * blocks (`codex`, `bridge`). The per-org `access` block is emitted COMPLETE
+ * ({dmPolicy, dmAllowFrom, groupPolicy, groups}) with claude-openmax's onboarding
+ * defaults — a private-by-default posture the old `{dmPolicy:"open"}` could not
+ * express — so an operator can widen it later without hand-editing the shape. */
+function assembleConfig(input: OnboardInput, identityId: string, apiKey: string, orgId: string, self: SelfInfo): Record<string, unknown> {
 	return {
-		cws: { bffUrl: input.bff_url, wsUrl: input.ws_url, identityId: registered.identityId, apiKey: registered.apiKey },
+		enabled: true,
+		server: { bff_url: input.bff_url, ws_url: input.ws_url, frontend_base_path: "/workspace" },
+		agent: {
+			identity_id: identityId,
+			api_key: apiKey,
+			// Global device id derived from the resolved member_id (preserves the old
+			// per-org derivation as a stable, human-recognizable default).
+			device_id: `codex-openmax-${self.memberId.slice(-6)}`,
+			app_version: "codex-openmax/0.1.0",
+		},
+		orgs: {
+			[orgId]: {
+				enabled: true,
+				org_id: orgId,
+				org_name: "",
+				owner: { member_id: "", name: "" },
+				self: { member_id: self.memberId, name: self.displayName, display_name: self.displayName },
+				access: { dmPolicy: "owner", dmAllowFrom: [], groupPolicy: "allowlist", groups: {} },
+			},
+		},
 		codex: { bin: "codex", cwd: "." },
 		bridge: { localHttpPort: input.local_http_port ?? 8787 },
-		org: {
-			org_id: accepted.orgId,
-			self: { member_id: self.memberId, display_name: self.displayName },
-			access: { dmPolicy: "open" },
-		},
 	};
 }
 

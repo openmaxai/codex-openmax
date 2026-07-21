@@ -171,10 +171,21 @@ describe("onboarding: buildConfig pipeline (api_key + identity_id)", () => {
 			local_http_port: 9999,
 		});
 		expect(cfg).toEqual({
-			cws: { bffUrl: "https://x.test", wsUrl: "wss://x.test/ws", identityId: "id_direct", apiKey: "sk_direct" },
+			enabled: true,
+			server: { bff_url: "https://x.test", ws_url: "wss://x.test/ws", frontend_base_path: "/workspace" },
+			agent: { identity_id: "id_direct", api_key: "sk_direct", device_id: "codex-openmax-m_9", app_version: "codex-openmax/0.1.0" },
+			orgs: {
+				org_1: {
+					enabled: true,
+					org_id: "org_1",
+					org_name: "",
+					owner: { member_id: "", name: "" },
+					self: { member_id: "m_9", name: "codex-bot", display_name: "codex-bot" },
+					access: { dmPolicy: "owner", dmAllowFrom: [], groupPolicy: "allowlist", groups: {} },
+				},
+			},
 			codex: { bin: "codex", cwd: "." },
 			bridge: { localHttpPort: 9999 },
-			org: { org_id: "org_1", self: { member_id: "m_9", display_name: "codex-bot" }, access: { dmPolicy: "open" } },
 		});
 		expect(calls.some((c) => c.url.includes("/accept"))).toBe(false); // no agent-side invitation redemption exists
 	});
@@ -221,10 +232,21 @@ describe("onboarding: buildConfig pipeline (invitation_id + invitation_token, se
 			local_http_port: 9999,
 		});
 		expect(cfg).toEqual({
-			cws: { bffUrl: "https://x.test", wsUrl: "wss://x.test/ws", identityId: "id_registered", apiKey: "sk_registered" },
+			enabled: true,
+			server: { bff_url: "https://x.test", ws_url: "wss://x.test/ws", frontend_base_path: "/workspace" },
+			agent: { identity_id: "id_registered", api_key: "sk_registered", device_id: "codex-openmax-m_9", app_version: "codex-openmax/0.1.0" },
+			orgs: {
+				org_from_accept: {
+					enabled: true,
+					org_id: "org_from_accept",
+					org_name: "",
+					owner: { member_id: "", name: "" },
+					self: { member_id: "m_9", name: "codex-bot", display_name: "codex-bot" },
+					access: { dmPolicy: "owner", dmAllowFrom: [], groupPolicy: "allowlist", groups: {} },
+				},
+			},
 			codex: { bin: "codex", cwd: "." },
 			bridge: { localHttpPort: 9999 },
-			org: { org_id: "org_from_accept", self: { member_id: "m_9", display_name: "codex-bot" }, access: { dmPolicy: "open" } },
 		});
 		// full sequence: register, identity-only exchange, accept, org-scoped exchange, /me
 		expect(calls.filter((c) => c.url.includes("/auth/register/agent"))).toHaveLength(1);

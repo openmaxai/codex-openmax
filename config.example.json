@@ -1,5 +1,45 @@
 {
-  "cws":    { "bffUrl": "https://openmax.com", "wsUrl": "wss://openmax.com/ws", "identityId": "", "apiKey": "" },
-  "codex":  { "bin": "codex", "cwd": "." },
-  "bridge": { "localHttpPort": 8787 }
+  "enabled": true,
+  "server": {
+    "bff_url": "https://your-cws-core.example.com",
+    "ws_url": "wss://your-cws-comm.example.com/cws-comm",
+    "frontend_base_path": "/workspace"
+  },
+  "agent": {
+    "identity_id": "",
+    "api_key": "cwsk_replace_me",
+    "device_id": "codex-openmax-device-1",
+    "app_version": "codex-openmax/0.1.0"
+  },
+  "cf_access": {
+    "client_id": "",
+    "client_secret": ""
+  },
+  "orgs": {
+    "019f0000-0000-7000-8000-000000000000": {
+      "enabled": true,
+      "org_id": "019f0000-0000-7000-8000-000000000000",
+      "org_name": "My Org",
+      "owner": { "member_id": "", "name": "" },
+      "self": { "member_id": "", "name": "Codex", "display_name": "" },
+      "access": {
+        "dmPolicy": "owner",
+        "dmAllowFrom": [],
+        "groupPolicy": "allowlist",
+        "groups": {
+          "019f0000-0000-7000-8000-conversation1": {
+            "mode": "mention",
+            "allowFrom": ["*"]
+          }
+        }
+      }
+    }
+  },
+  "codex": {
+    "bin": "codex",
+    "cwd": "."
+  },
+  "bridge": {
+    "localHttpPort": 8787
+  }
 }
