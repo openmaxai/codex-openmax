@@ -10,7 +10,16 @@
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import { buildConfig, writeConfigFile, type FetchLike, type OnboardInput } from "./onboarding.js";
-import { loadConfig, type AppConfig } from "./config.js";
+import { loadConfig, resolveConfigPath, type AppConfig } from "./config.js";
+import { buildConfigProvider } from "./runtime-config.js";
+import { makeSyncSelf } from "./owner-sync.js";
+import { handleConfigEvent } from "./config-events.js";
+import { everyMs } from "./scheduler.js";
+import { resolveVersionCheckSchedule, makeVersionCheck } from "./version-check.js";
+
+// Owner re-sync cadence for long-lived connections (the SDK only hydrates self at
+// connect time). 5 min mirrors the zylos OWNER_SYNC_INTERVAL_MS.
+const OWNER_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 
 function usage(): never {
 	console.error(`usage:
@@ -83,16 +92,20 @@ async function cmdStart(): Promise<void> {
 	const sdk = (await import("@openmaxai/openmax-agent-sdk")) as Record<string, any>;
 	const { createSdkCwsBridge } = await import("./bridge/sdk-bridge.js");
 	const { main } = await import("./index.js");
-	const { server, agent, cfAccess, orgs } = config;
+	const { server, agent, cfAccess } = config;
 	const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 	const logger = { info: log, warn: log, error: log, debug: () => {}, log };
+	// Runtime config provider: owns the mutable config state + the single on-disk writer.
+	// enabledOrgs() returns the SAME org objects handed to the SDK as orgConfigs (captured by
+	// reference), so owner/self/access write-backs are visible to the SDK without a restart.
+	const provider = buildConfigProvider(config, resolveConfigPath(), logger);
 	// The SDK's cfAccessHeaders() reads `cfg.cf_access.{client_id,client_secret}` (WRAPPED),
 	// so the bare block must be wrapped as { cf_access: ... }; env COCO_CF_ACCESS_* still wins
 	// inside the SDK. Omitted entirely when no cf_access is configured.
 	const cfAccessWrapped = cfAccess ? { cf_access: cfAccess } : undefined;
 	// enabled:false opts an org out (mirrors claude-openmax / the openmax component).
-	const activeOrgs = orgs.filter((o) => o.enabled !== false);
-	const defaultOrgId = () => activeOrgs[0]?.org_id ?? orgs[0].org_id;
+	const activeOrgs = provider.enabledOrgs();
+	const defaultOrgId = () => activeOrgs[0]?.org_id ?? config.orgs[0].org_id;
 	const tokenManager = new sdk.TokenManager({
 		apiKey: agent.apiKey,
 		coreUrl: server.bffUrl,
@@ -112,6 +125,9 @@ async function cmdStart(): Promise<void> {
 		resolveDefaultOrgId: defaultOrgId,
 		logger,
 	});
+	// syncSelf hydrates self.display_name + owner from cws-core (pull-based). Serves the
+	// SDK's connect-time self-name barrier AND the periodic owner re-sync below.
+	const syncSelf = makeSyncSelf(http, provider, logger);
 	const bridge = createSdkCwsBridge(
 		(deliver) =>
 			new sdk.CwsAgentBridge({
@@ -125,14 +141,47 @@ async function cmdStart(): Promise<void> {
 				},
 				orgConfigs: activeOrgs,
 				providers: { logger, inbound: { deliver } },
-				callbacks: { syncSelf: async () => ({ nameReady: true }) },
+				callbacks: {
+					syncSelf,
+					// The SDK reads this at the hydration barrier; org_id-keyed enabled-org view.
+					loadConfig: () => ({ orgs: Object.fromEntries(provider.enabledOrgs().map((o) => [o.org_id, o])) }),
+					// agent.config.* → apply to access + persist. Let it throw so the SDK retries.
+					onConfigEvent: async (orgConfig: any, evt: any) =>
+						handleConfigEvent(provider, orgConfig, { event: evt.event, data: evt.data }, { log: logger, resyncOwner: syncSelf }),
+					// Owner auto-bind fallback (core had none) / owner name hint → persist.
+					onOwnerBind: (orgId: string, memberId: string, displayName: string) => provider.setOwner(orgId, memberId, displayName || ""),
+					onOwnerNameHint: (orgId: string, name: string) => {
+						const org = provider.getOrgByOrgId(orgId);
+						if (org) {
+							org.owner = { ...(org.owner || { member_id: "" }), name };
+							provider.persist();
+						}
+					},
+				},
 				reporters: { metrics: false },
 			}),
 	);
 	const handle = await main(bridge);
 	log(`[codex-openmax] online — adapter on :${handle.port}, orgs=${activeOrgs.map((o) => o.org_id).join(",")}`);
+
+	// Periodic timers (disposed in stop()). All background work swallows rejections (everyMs).
+	const disposers: Array<() => void> = [];
+	// (1) Owner re-sync — covers long-lived connections the connect-time barrier can't.
+	disposers.push(everyMs(OWNER_SYNC_INTERVAL_MS, async () => {
+		for (const org of provider.enabledOrgs()) await syncSelf(org);
+	}));
+	// (2) Version check (option 甲) — opt-in; DM the owner on a newer npm release, never self-upgrade.
+	const vcSchedule = resolveVersionCheckSchedule(config.versionCheck);
+	if (vcSchedule.enabled) {
+		const comm = sdk.createCommService(http, provider);
+		const check = makeVersionCheck({ provider, comm, log: logger });
+		disposers.push(everyMs(vcSchedule.intervalMs, check));
+		log(`[codex-openmax] version-check enabled (every ${vcSchedule.intervalHours}h)`);
+	}
+
 	const stop = async () => {
 		log("[codex-openmax] stopping…");
+		for (const dispose of disposers) dispose();
 		await handle.stop();
 		process.exit(0);
 	};
