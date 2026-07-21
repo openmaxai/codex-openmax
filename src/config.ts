@@ -38,7 +38,7 @@ export interface OrgAccess {
 	dmPolicy?: string;
 	dmAllowFrom?: string[];
 	groupPolicy?: string;
-	groups?: Record<string, unknown>;
+	groups?: Record<string, { mode?: string; allowFrom?: string[] }>;
 }
 
 /** One org, in the bridge / openmax-mirrored shape handed straight to the SDK
@@ -61,6 +61,10 @@ export interface AppConfig {
 	// codex-openmax runtime-specific (no analog in claude-openmax / openmax):
 	codex: { bin: string; cwd: string };
 	bridge: { localHttpPort: number };
+	// Optional periodic "a newer release is on npm" check (option 甲 — notify the
+	// owner, never self-upgrade). On disk under `version_check`. Disabled unless
+	// explicitly enabled; see version-check.ts.
+	versionCheck?: { enabled?: boolean; intervalHours?: number };
 }
 
 const REQUIRED = [
@@ -94,11 +98,20 @@ function parseOrgs(raw: Record<string, any>): OrgConfig[] {
 }
 
 /**
+ * Resolve the config file path exactly as loadConfig does. Exported so the runtime
+ * config provider (runtime-config.ts) writes back to the SAME file loadConfig read
+ * from — the two must agree or a persist would target the wrong path.
+ */
+export function resolveConfigPath(path?: string): string {
+	return path ?? process.env.CODEX_OPENMAX_CONFIG ?? "config.json";
+}
+
+/**
  * Load config from a JSON file (path arg, else $CODEX_OPENMAX_CONFIG, else ./config.json),
  * then apply env overrides, then validate required fields. Throws on missing/invalid.
  */
 export function loadConfig(path?: string): AppConfig {
-	const file = path ?? process.env.CODEX_OPENMAX_CONFIG ?? "config.json";
+	const file = resolveConfigPath(path);
 	let raw: Record<string, any> = {};
 	try {
 		raw = JSON.parse(readFileSync(file, "utf8"));
@@ -133,6 +146,16 @@ export function loadConfig(path?: string): AppConfig {
 		bridge: {
 			localHttpPort: Number(process.env.BRIDGE_HTTP_PORT ?? raw.bridge?.localHttpPort ?? DEFAULT_LOCAL_HTTP_PORT),
 		},
+		// Optional; on disk as `version_check: { enabled, interval_hours }`. Absent → undefined
+		// (version-check stays disabled). resolveVersionCheckSchedule owns the default interval.
+		...(raw.version_check && typeof raw.version_check === "object"
+			? {
+					versionCheck: {
+						...(raw.version_check.enabled !== undefined ? { enabled: !!raw.version_check.enabled } : {}),
+						...(raw.version_check.interval_hours !== undefined ? { intervalHours: Number(raw.version_check.interval_hours) } : {}),
+					},
+				}
+			: {}),
 	};
 
 	const missing = REQUIRED.filter(([, get]) => !get(cfg)).map(([name]) => name);
