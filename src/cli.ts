@@ -9,8 +9,8 @@
 //           graceful SIGINT/SIGTERM.
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
-import { readFileSync } from "node:fs";
 import { buildConfig, writeConfigFile, type FetchLike, type OnboardInput } from "./onboarding.js";
+import { loadConfig, type AppConfig } from "./config.js";
 
 function usage(): never {
 	console.error(`usage:
@@ -57,9 +57,10 @@ async function cmdInit(args: string[]): Promise<void> {
 		} catch {
 			console.error("init: WARNING — `codex` binary not found on PATH; install it before `start`");
 		}
-		const org = (config.org as { self?: { display_name?: string } }).self?.display_name ?? "?";
+		const orgs = config.orgs as Record<string, { self?: { display_name?: string } }>;
+		const self = Object.values(orgs)[0]?.self?.display_name ?? "?";
 		// Machine-readable success line. No secrets: display name + org only.
-		console.log(JSON.stringify({ ok: true, org: input.org_id, self: org, codex: codexOk }));
+		console.log(JSON.stringify({ ok: true, org: input.org_id, self, codex: codexOk }));
 	} catch (e) {
 		console.error(`init: ${e instanceof Error ? e.message : String(e)}`);
 		process.exit(1);
@@ -67,37 +68,48 @@ async function cmdInit(args: string[]): Promise<void> {
 }
 
 async function cmdStart(): Promise<void> {
-	let cfg: Record<string, unknown>;
+	let config: AppConfig;
 	try {
-		cfg = JSON.parse(readFileSync("config.json", "utf8")) as Record<string, unknown>;
-	} catch {
-		console.error("start: ./config.json missing or invalid — run `codex-openmax init` first");
+		config = loadConfig();
+	} catch (e) {
+		console.error(`start: ${e instanceof Error ? e.message : String(e)} — run \`codex-openmax init\` first`);
 		process.exit(1);
 	}
-	if (!(cfg.org as { org_id?: string } | undefined)?.org_id) {
-		console.error("start: config.json lacks an org block — re-run init");
+	if (!config.orgs.length) {
+		console.error("start: config.json has no orgs — re-run init");
 		process.exit(1);
 	}
 	// The SDK ships plain JS/ESM with no type declarations; construct via dynamic import.
 	const sdk = (await import("@openmaxai/openmax-agent-sdk")) as Record<string, any>;
 	const { createSdkCwsBridge } = await import("./bridge/sdk-bridge.js");
 	const { main } = await import("./index.js");
-	const cws = cfg.cws as { bffUrl: string; wsUrl: string; apiKey: string };
-	const org = cfg.org as { org_id: string; self: { member_id: string } };
+	const { server, agent, cfAccess, orgs } = config;
 	const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 	const logger = { info: log, warn: log, error: log, debug: () => {}, log };
+	// The SDK's cfAccessHeaders() reads `cfg.cf_access.{client_id,client_secret}` (WRAPPED),
+	// so the bare block must be wrapped as { cf_access: ... }; env COCO_CF_ACCESS_* still wins
+	// inside the SDK. Omitted entirely when no cf_access is configured.
+	const cfAccessWrapped = cfAccess ? { cf_access: cfAccess } : undefined;
+	// enabled:false opts an org out (mirrors claude-openmax / the openmax component).
+	const activeOrgs = orgs.filter((o) => o.enabled !== false);
+	const defaultOrgId = () => activeOrgs[0]?.org_id ?? orgs[0].org_id;
 	const tokenManager = new sdk.TokenManager({
-		apiKey: cws.apiKey,
-		coreUrl: cws.bffUrl,
+		apiKey: agent.apiKey,
+		coreUrl: server.bffUrl,
+		...(cfAccessWrapped ? { cfAccess: cfAccessWrapped } : {}),
 		storage: sdk.memoryStorage(),
-		resolveDefaultOrgId: () => org.org_id,
+		resolveDefaultOrgId: defaultOrgId,
 		logger,
 	});
 	const http = new sdk.CwsHttpClient({
-		baseUrl: cws.bffUrl,
-		apiKey: cws.apiKey,
+		baseUrl: server.bffUrl,
+		apiKey: agent.apiKey,
+		deviceId: agent.deviceId,
+		clientVersion: agent.appVersion,
+		...(cfAccessWrapped ? { cfAccess: cfAccessWrapped } : {}),
+		frontendBasePath: server.frontendBasePath,
 		tokenManager,
-		resolveDefaultOrgId: () => org.org_id,
+		resolveDefaultOrgId: defaultOrgId,
 		logger,
 	});
 	const bridge = createSdkCwsBridge(
@@ -105,15 +117,20 @@ async function cmdStart(): Promise<void> {
 			new sdk.CwsAgentBridge({
 				http,
 				tokenManager,
-				ws: { baseUrl: cws.wsUrl, deviceId: `codex-openmax-${org.self.member_id.slice(-6)}`, clientVersion: "codex-openmax/0.0.1" },
-				orgConfigs: [cfg.org],
+				ws: {
+					baseUrl: server.wsUrl,
+					deviceId: agent.deviceId,
+					clientVersion: agent.appVersion,
+					...(cfAccessWrapped ? { cfAccess: cfAccessWrapped } : {}),
+				},
+				orgConfigs: activeOrgs,
 				providers: { logger, inbound: { deliver } },
 				callbacks: { syncSelf: async () => ({ nameReady: true }) },
 				reporters: { metrics: false },
 			}),
 	);
 	const handle = await main(bridge);
-	log(`[codex-openmax] online — adapter on :${handle.port}, org=${org.org_id}`);
+	log(`[codex-openmax] online — adapter on :${handle.port}, orgs=${activeOrgs.map((o) => o.org_id).join(",")}`);
 	const stop = async () => {
 		log("[codex-openmax] stopping…");
 		await handle.stop();
