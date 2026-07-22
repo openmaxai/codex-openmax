@@ -54,7 +54,7 @@ export function makeSyncSelf(http: HttpForOrg, provider: ConfigProvider, log: Lo
 
 		let member: MemberRecord;
 		try {
-			member = (await http.getForOrg(orgId, http.apiPath(`/members/${selfMemberId}`))) as MemberRecord;
+			member = (await http.getForOrg(orgId, http.apiPath(`/members/${encodeURIComponent(selfMemberId)}`))) as MemberRecord;
 		} catch (err) {
 			log.warn?.(`[${orgId}] owner-sync: fetch self member failed: ${err instanceof Error ? err.message : String(err)} — keeping local owner`);
 			return { nameReady: false, reason: `fetch self member failed: ${err instanceof Error ? err.message : String(err)}` };
@@ -73,18 +73,35 @@ export function makeSyncSelf(http: HttpForOrg, provider: ConfigProvider, log: Lo
 		if (!coreOwnerId) return { nameReady: true, displayName: coreDisplayName || undefined };
 
 		const localOwnerId = orgConfig.owner?.member_id || "";
-		if (coreOwnerId === localOwnerId) return { nameReady: true, displayName: coreDisplayName || undefined };
+		const localOwnerName = orgConfig.owner?.name || "";
+		// Fully in sync (id matches AND we already have a name) → nothing to do. Do NOT
+		// early-return when the id matches but the local name is EMPTY: a prior owner-name
+		// fetch may have failed/timed out and bound an empty name (the catch below swallows
+		// it — name is cosmetic, must not block the bind); this is the path that backfills
+		// it on a later tick.
+		if (coreOwnerId === localOwnerId && localOwnerName)
+			return { nameReady: true, displayName: coreDisplayName || undefined };
 
 		let ownerName = "";
 		try {
-			const ownerMember = (await http.getForOrg(orgId, http.apiPath(`/members/${coreOwnerId}`))) as MemberRecord;
+			const ownerMember = (await http.getForOrg(orgId, http.apiPath(`/members/${encodeURIComponent(coreOwnerId)}`))) as MemberRecord;
 			ownerName = ownerMember?.display_name || ownerMember?.username || "";
 		} catch {
 			// owner display_name is cosmetic — a fetch failure must not block the owner bind.
 		}
+
+		// Only write when something ACTUALLY changed — a new owner id, or a non-empty
+		// fetched name that differs from the local one (the backfill case). If core still
+		// returns no name for an already-bound owner, skip the write so a steady state does
+		// not re-persist an empty name on every periodic tick.
+		const idChanged = coreOwnerId !== localOwnerId;
+		const nameChanged = !!ownerName && ownerName !== localOwnerName;
+		if (!idChanged && !nameChanged)
+			return { nameReady: true, displayName: coreDisplayName || undefined };
+
 		provider.setOwner(orgId, coreOwnerId, ownerName);
 		orgConfig.owner = { member_id: coreOwnerId, name: ownerName };
-		log.info?.(`[${orgId}] owner synced from core: ${localOwnerId || "(none)"} → ${coreOwnerId}${ownerName ? ` (${ownerName})` : ""}`);
+		log.info?.(`[${orgId}] owner synced from core: ${localOwnerId || "(none)"} → ${coreOwnerId}${ownerName ? ` (${ownerName})` : ""}${idChanged ? "" : " (name backfill)"}`);
 
 		return { nameReady: true, displayName: coreDisplayName || undefined };
 	};
