@@ -47,7 +47,15 @@ interface Route {
 	data?: unknown;
 	capture?: (body: unknown) => void;
 }
-function routingFetch(routes: Route[]) {
+/**
+ * Route table over the injected fetch. The unrouted fallback answers 200 {} — the
+ * existing cases only route two GETs and rely on that silence for everything else the
+ * SDK pipeline touches — so on its own it is a BLIND spot: a request that never fired,
+ * fired twice, or hit the wrong path all look identical from the assertions. Every
+ * unrouted request is therefore recorded in `unmatched`, and each case asserts that
+ * ledger is empty, which turns "the fallback answered" back into a visible event.
+ */
+function routingFetch(routes: Route[], unmatched: string[] = []) {
 	return async (url: string, opts: { method?: string; body?: string } = {}) => {
 		const method = opts.method || "GET";
 		for (const r of routes) {
@@ -56,21 +64,29 @@ function routingFetch(routes: Route[]) {
 				return mkRes(200, JSON.stringify({ data: r.data ?? {}, request_id: "r" }));
 			}
 		}
+		unmatched.push(`${method} ${url}`);
 		return mkRes(200, JSON.stringify({ data: {}, request_id: "r" }));
 	};
 }
 
 /** Build my CwsBridge on a REAL CwsAgentBridge wired to the fixture's org + fetch routes. */
-async function startRealBridge(fx: { org: { org_id: string }; frame: { payload: { conversation_id: string; id: string } }; detail: unknown; conversation: unknown }, extraRoutes: Route[] = []) {
+async function startRealBridge(
+	fx: { org: { org_id: string }; frame: { payload: { conversation_id: string; id: string } }; detail: unknown; conversation: unknown },
+	extraRoutes: Route[] = [],
+	unmatched: string[] = [],
+) {
 	const conv = fx.frame.payload.conversation_id;
 	const msgId = fx.frame.payload.id;
 	const http = new CwsHttpClient({
 		baseUrl: "http://api.test",
-		fetch: routingFetch([
-			{ match: (u, m) => m === "GET" && new RegExp(`/conversations/${reEsc(conv)}/messages/${reEsc(msgId)}$`).test(u), data: fx.detail },
-			{ match: (u, m) => m === "GET" && new RegExp(`/conversations/${reEsc(conv)}$`).test(u), data: fx.conversation },
-			...extraRoutes,
-		]),
+		fetch: routingFetch(
+			[
+				{ match: (u, m) => m === "GET" && new RegExp(`/conversations/${reEsc(conv)}/messages/${reEsc(msgId)}$`).test(u), data: fx.detail },
+				{ match: (u, m) => m === "GET" && new RegExp(`/conversations/${reEsc(conv)}$`).test(u), data: fx.conversation },
+				...extraRoutes,
+			],
+			unmatched,
+		),
 		logger: quietLogger,
 	});
 	http.setApiKey("test-key");
@@ -96,7 +112,8 @@ describe("REAL-SDK integration (CwsAgentBridge → sdk-bridge → wake contract)
 		process.env.COCO_RPC_LOG = "0";
 		const fx = readJson(`${FIXTURES}/01-dm-open-basic.json`);
 		const wakes: WakeRequest[] = [];
-		const { bridge, inject } = await startRealBridge(fx);
+		const unmatched: string[] = [];
+		const { bridge, inject } = await startRealBridge(fx, [], unmatched);
 		bridge.onInbound(async (w) => {
 			wakes.push(w);
 			return { ok: true, runtimeSession: "thr_1" };
@@ -106,13 +123,15 @@ describe("REAL-SDK integration (CwsAgentBridge → sdk-bridge → wake contract)
 		expect(wakes).toEqual([
 			{ schema: "raft-channel-wake.v1", messageId: "m1", conversationId: "c1", senderId: "u1", contentPreview: "hello" },
 		]);
+		expect(unmatched).toEqual([]); // no unrouted request answered by the silent fallback
 		await bridge.stop();
 	});
 
 	it("KILLING: an UNRESOLVED sender from the real pipeline OMITS senderId (sender-less wake is legal per SDK v1)", async () => {
 		const fx = readJson(`${FIXTURES}/05-dm-sender-unresolved.json`);
 		const wakes: WakeRequest[] = [];
-		const { bridge, inject } = await startRealBridge(fx);
+		const unmatched: string[] = [];
+		const { bridge, inject } = await startRealBridge(fx, [], unmatched);
 		bridge.onInbound(async (w) => {
 			wakes.push(w);
 			return { ok: true };
@@ -121,19 +140,25 @@ describe("REAL-SDK integration (CwsAgentBridge → sdk-bridge → wake contract)
 		await flush();
 		expect(wakes).toHaveLength(1);
 		expect("senderId" in wakes[0]).toBe(false); // absent on InboundMessage → absent on the wire (fixture 04-sender-less)
+		expect(unmatched).toEqual([]);
 		await bridge.stop();
 	});
 
 	it("outbound: send() routes through the endpoint/orgId captured from the real delivery and posts AGENT_TEXT with parent_id", async () => {
 		const fx = readJson(`${FIXTURES}/01-dm-open-basic.json`);
 		const posted: Array<Record<string, unknown>> = [];
-		const { bridge, inject } = await startRealBridge(fx, [
-			{
-				match: (u, m) => m === "POST" && /\/conversations\/c1\/messages$/.test(u),
-				data: { id: "srv_9" },
-				capture: (b) => posted.push(b as Record<string, unknown>),
-			},
-		]);
+		const unmatched: string[] = [];
+		const { bridge, inject } = await startRealBridge(
+			fx,
+			[
+				{
+					match: (u, m) => m === "POST" && /\/conversations\/c1\/messages$/.test(u),
+					data: { id: "srv_9" },
+					capture: (b) => posted.push(b as Record<string, unknown>),
+				},
+			],
+			unmatched,
+		);
 		bridge.onInbound(async () => ({ ok: true }) as WakeResponse);
 		inject();
 		await flush();
@@ -144,6 +169,7 @@ describe("REAL-SDK integration (CwsAgentBridge → sdk-bridge → wake contract)
 		expect(posted[0].type).toBe("AGENT_TEXT");
 		expect(posted[0].parent_id).toBe("m1");
 		expect((posted[0].content as { body: { text: string } }).body.text).toBe("PONG");
+		expect(unmatched).toEqual([]);
 		await bridge.stop();
 	});
 
@@ -151,12 +177,16 @@ describe("REAL-SDK integration (CwsAgentBridge → sdk-bridge → wake contract)
 		const fx = readJson(`${FIXTURES}/01-dm-open-basic.json`);
 		// Observe deliver()'s ACTUAL resolution by wrapping the inbound provider the SDK calls.
 		const deliverResults: WakeResponse[] = [];
+		const unmatched: string[] = [];
 		const http = new CwsHttpClient({
 			baseUrl: "http://api.test",
-			fetch: routingFetch([
-				{ match: (u, m) => m === "GET" && /\/conversations\/c1\/messages\/m1$/.test(u), data: fx.detail },
-				{ match: (u, m) => m === "GET" && /\/conversations\/c1$/.test(u), data: fx.conversation },
-			]),
+			fetch: routingFetch(
+				[
+					{ match: (u, m) => m === "GET" && /\/conversations\/c1\/messages\/m1$/.test(u), data: fx.detail },
+					{ match: (u, m) => m === "GET" && /\/conversations\/c1$/.test(u), data: fx.conversation },
+				],
+				unmatched,
+			),
 			logger: quietLogger,
 		});
 		http.setApiKey("test-key");
@@ -186,6 +216,7 @@ describe("REAL-SDK integration (CwsAgentBridge → sdk-bridge → wake contract)
 		sdk!.injectFrame(fx.org.org_id, fx.frame);
 		await flush();
 		expect(deliverResults).toEqual([{ ok: false, failureClass: "wake_failed", retryAfterMs: 2000 }]);
+		expect(unmatched).toEqual([]);
 		await bridge.stop();
 	});
 });

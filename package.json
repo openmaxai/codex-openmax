@@ -25,7 +25,7 @@
 		"vitest": "^2.0.0"
 	},
 	"dependencies": {
-		"@openmaxai/openmax-agent-sdk": "^1.0.1"
+		"@openmaxai/openmax-agent-sdk": "^1.0.3"
 	},
 	"bin": {
 		"codex-openmax": "dist/cli.js"
