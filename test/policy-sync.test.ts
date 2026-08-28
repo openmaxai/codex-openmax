@@ -22,7 +22,23 @@ import {
 	type ServerPolicySnapshot,
 } from "../src/policy-sync.js";
 
+// The real gate, not a stand-in: the point of the adopt-side assertions below is that a
+// value decideInbound cannot read is a value that SKIPS a gate, so they are only meaningful
+// when driven through the same function the runtime uses.
+import { decideInbound } from "@openmaxai/openmax-agent-sdk";
+
 const quietLog = { info() {}, warn() {}, error() {} };
+
+const GROUP_CONV = { id: "c_x", type: "group" };
+const groupMsg = (mentions: string[] = []) => ({
+	conversation_id: "c_x",
+	sender_id: "stranger",
+	sender_type: "human",
+	mentions,
+	content: { body: { text: "plain chatter" } },
+});
+const gate = (access: OrgAccess, mentions: string[] = []) =>
+	decideInbound(groupMsg(mentions), GROUP_CONV, { self: { member_id: "me", name: "oc" }, owner: { member_id: "own" }, access });
 
 // access defaults mirror the real ex-codex config.json shape (same block as
 // test/owner-sync.test.ts's baseConfig).
@@ -176,6 +192,63 @@ describe("adoptServerPolicy — 拉取方向", () => {
 	it("响应缺 group_scope 时退回 'allowlist' 而非服务端自己的 'open' 默认（畸形响应不许放宽群暴露面）", () => {
 		expect(adoptServerPolicy({}).groupPolicy).toBe("allowlist");
 		expect(adoptServerPolicy(null).dmPolicy).toBe("owner");
+	});
+
+	it("越界的 group_scope 不许原样落地——decideInbound 只认 disabled/allowlist，别的字符串会整个跳过白名单闸", async () => {
+		const local: OrgAccess = { dmPolicy: "owner", dmAllowFrom: [], groupPolicy: "allowlist", groups: {} };
+		const adopted = adoptServerPolicy({ group_scope: "members", groups: [], group_allowlist: [], updated_at: 1 }, local);
+		expect(adopted.groupPolicy).toBe("allowlist");
+		expect((await gate(adopted, ["me"])).handle).toBe(false);
+		// 对照：不校验时那个字符串会直接进 access，闸失效。
+		expect((await gate({ ...local, groupPolicy: "members" }, ["me"])).handle).toBe(true);
+	});
+
+	it("越界的 per-group mode 不许原样落地——decideInbound 只特判 mention，别的字符串会绕过 @ 要求", async () => {
+		const local: OrgAccess = { dmPolicy: "owner", dmAllowFrom: [], groupPolicy: "allowlist", groups: { c_x: { mode: "mention", allowFrom: ["*"] } } };
+		const adopted = adoptServerPolicy(
+			{ group_scope: "allowlist", groups: [{ conversation_id: "c_x", mode: "quiet", allow_from: ["*"] }], group_allowlist: ["c_x"], updated_at: 1 },
+			local,
+		);
+		expect(adopted.groups?.c_x?.mode).toBe("mention");
+		expect((await gate(adopted)).handle).toBe(false);
+		// 对照：mode 原样落地时，没被 @ 的消息也会被处理。
+		expect((await gate({ ...local, groups: { c_x: { mode: "quiet", allowFrom: ["*"] } } })).handle).toBe(true);
+	});
+
+	it("allowlist 模式下,owner 刚移除的群不许被存活的逐群行复活（cws-comm 的 remove 只改 allowlist、不删行）", async () => {
+		const adopted = adoptServerPolicy({
+			group_scope: "allowlist",
+			groups: [{ conversation_id: "c_x", mode: "mention", allow_from: ["*"] }],
+			group_allowlist: [],
+			updated_at: 1,
+		});
+		expect(adopted.groups).toEqual({});
+		expect((await gate(adopted, ["me"])).handle).toBe(false);
+	});
+
+	it("open/disabled 模式下 allowlist 不是闸,仍应取并集以保住逐群 mode", () => {
+		const adopted = adoptServerPolicy({
+			group_scope: "open",
+			groups: [{ conversation_id: "c_x", mode: "smart", allow_from: ["*"] }],
+			group_allowlist: ["c_y"],
+			updated_at: 1,
+		});
+		expect(adopted.groupPolicy).toBe("open");
+		expect(Object.keys(adopted.groups || {}).sort()).toEqual(["c_x", "c_y"]);
+		expect(adopted.groups?.c_x?.mode).toBe("smart");
+	});
+});
+
+describe("makeReconcilePolicy — updated_at 的两种线上格式", () => {
+	it("RFC3339 形式的 updated_at 不许被读成 0——否则一个全默认的策略行会被当成「无行」,每个 tick 都无条件 PUT", async () => {
+		const { provider, org } = setup();
+		// 真实可达的状态：owner 只改过 DM 策略,于是行存在但几个数组都是空的。
+		const { http, puts } = fakeHttp({
+			get: () => ({ dm_policy: "open", dm_allowlist: [], group_scope: "open", groups: [], group_allowlist: [], updated_at: "2026-08-28T06:51:45Z" }),
+		});
+		const reconcile = makeReconcilePolicy(http, provider, quietLog);
+		expect(await reconcile(org)).toBe("adopted");
+		expect(puts).toEqual([]);
 	});
 });
 

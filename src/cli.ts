@@ -183,6 +183,19 @@ async function cmdStart(): Promise<void> {
 	const handle = await main(bridge);
 	log(`[codex-openmax] online — adapter on :${handle.port}, orgs=${activeOrgs.map((o) => o.org_id).join(",")}`);
 
+	// Registered BEFORE the bootstrap round-trip below: that loop is the first network I/O in
+	// this function, and a Ctrl+C landing inside it used to bypass stop() entirely. stop() is
+	// only defined further down, so the handler holds a ref and remembers a signal that lands
+	// before it is filled in.
+	let requestStop: (() => void) | null = null;
+	let stopRequested = false;
+	const onSignal = () => {
+		if (requestStop) requestStop();
+		else stopRequested = true;
+	};
+	process.on("SIGINT", onSignal);
+	process.on("SIGTERM", onSignal);
+
 	// Bootstrap reconcile. bridge.start() has already awaited the SDK's self-name hydration
 	// barrier, so self.member_id and the org JWT are both in place by here — the earliest
 	// point at which the policy round-trip can succeed, and a full interval before the first
@@ -217,8 +230,8 @@ async function cmdStart(): Promise<void> {
 		await handle.stop();
 		process.exit(0);
 	};
-	process.on("SIGINT", () => void stop());
-	process.on("SIGTERM", () => void stop());
+	requestStop = () => void stop();
+	if (stopRequested) requestStop();
 }
 
 /**
@@ -245,7 +258,9 @@ async function cmdReportPolicy(): Promise<void> {
 	const reconcilePolicy = makeReconcilePolicy(http, provider, logger);
 	const results: Record<string, string> = {};
 	for (const org of provider.enabledOrgs()) results[org.org_id] = await reconcilePolicy(org, { force: true });
-	const ok = Object.values(results).every((r) => r === "pushed");
+	// every() on [] is true: with no enabled org nothing was attempted, which is not success.
+	const attempted = Object.values(results);
+	const ok = attempted.length > 0 && attempted.every((r) => r === "pushed");
 	// Machine-readable result line on stdout (logs go to stderr). No secrets.
 	console.log(JSON.stringify({ ok, orgs: results }));
 	// exitCode rather than exit(): the JSON line above is still draining to a pipe, and the

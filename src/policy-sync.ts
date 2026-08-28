@@ -32,6 +32,25 @@ import type { ConfigProvider, Logger } from "./runtime-config.js";
 import type { OrgConfig, OrgAccess } from "./config.js";
 import type { HttpForOrg } from "./owner-sync.js";
 import { everyMs } from "./scheduler.js";
+// The gate's own enums, not a local copy: decideInbound branches on these exact strings, so
+// a value it cannot read is a value that silently skips a gate. Re-exported from the package
+// root (src/index.js `export * from './protocol/access-policy.js'`).
+import { VALID_DM_POLICIES, VALID_GROUP_SCOPES, VALID_GROUP_MODES } from "@openmaxai/openmax-agent-sdk";
+
+/**
+ * Keep a server-supplied enum value only when the SDK's gate can actually read it.
+ *
+ * decideInbound tests group scope against 'disabled' and 'allowlist' and mode against
+ * 'mention'; every other string falls through to handle:true. So an out-of-enum value
+ * arriving on the wire (schema drift, a scope added server-side later, a proxy surprise)
+ * would not merely be ignored — it would DISABLE the gate it was meant to configure.
+ * Falls back to the local value, never to the server's own wider default.
+ */
+function adoptEnum(set: { has(v: string): boolean }, incoming: unknown, local: unknown, conservative: string): string {
+	if (typeof incoming === "string" && set.has(incoming)) return incoming;
+	if (typeof local === "string" && set.has(local)) return local;
+	return conservative;
+}
 
 /**
  * HTTP surface this module needs: owner-sync's read-only `HttpForOrg` plus the PUT.
@@ -66,7 +85,8 @@ export interface ServerPolicySnapshot {
 	dm_policy?: string;
 	dm_allowlist?: string[];
 	groups?: Array<{ conversation_id?: string; mode?: string; allow_from?: string[] }>;
-	updated_at?: number;
+	/** Two wire forms in circulation — see normalizeUpdatedAt. */
+	updated_at?: number | string | null;
 	group_scope?: string;
 	group_allowlist?: string[];
 }
@@ -86,10 +106,17 @@ export type ReconcileOutcome =
  * config-events.ts VALID_GROUP_MODES, which also contains 'silent': cws-comm's
  * ReportPolicy validates every group's mode against smart|mention and returns an
  * InputError for the FIRST offender, which fails the WHOLE report (400) — one silent
- * group would sink the entire snapshot. Locally 'silent' means "configured but not
- * participating", which the server schema cannot express, so such a group is dropped
- * from `groups` AND from `group_allowlist` (leaving it in the allowlist while omitting
- * its settings would re-open it at the server's default mention mode).
+ * group would sink the entire snapshot. Such a group is therefore dropped from `groups`
+ * AND from `group_allowlist` (leaving it in the allowlist while omitting its settings
+ * would re-open it at the server's default mention mode).
+ *
+ * NOTE on what 'silent' actually does, since it is easy to assume otherwise: the SDK gate
+ * has no 'silent' branch. decideInbound special-cases mode === 'mention' only, so a group
+ * left at mode 'silent' behaves like 'smart' — it answers EVERY message. "Configured but
+ * not participating" is produced by config-events.ts deleting the entry, not by storing
+ * the mode. That is also why the adopt path does not carry local 'silent' entries over: a
+ * preserved entry would answer everything in a group the owner silenced, which is worse
+ * than the group falling out of the allowlist.
  */
 const REPORTABLE_GROUP_MODES = new Set(["smart", "mention"]);
 
@@ -102,6 +129,27 @@ const REPORTABLE_GROUP_MODES = new Set(["smart", "mention"]);
  * `allowFrom || ['*']` yields `[]` and would be shown as "nobody" by the settings page.
  * Normalize all three to the explicit ['*'].
  */
+/**
+ * updated_at as an opaque monotonic token.
+ *
+ * Two wire forms are in circulation for the same field: cws-core's BFF sends a number
+ * (unix seconds) and cws-comm's own HTTP surface sends RFC3339. `Number(v) || 0` yields 0
+ * forever on the string form, which would be read as "no policy row" — turning the seed
+ * branch into an unconditional PUT every tick, exactly the erasure this module exists to
+ * prevent. Only equality and zero-ness are ever compared, so the unit does not matter;
+ * being parseable does.
+ */
+function normalizeUpdatedAt(v: unknown): number {
+	if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+	if (typeof v === "string" && v.trim()) {
+		const n = Number(v);
+		if (Number.isFinite(n)) return n;
+		const t = Date.parse(v);
+		if (Number.isFinite(t)) return t;
+	}
+	return 0;
+}
+
 function normalizeAllowFrom(list: string[] | undefined): string[] {
 	if (!Array.isArray(list) || list.length === 0) return ["*"];
 	return [...list];
@@ -154,30 +202,51 @@ export function buildReportedPolicy(access: OrgAccess = {}): ReportedPolicy {
 /**
  * Turn a server snapshot into a local `access` block (the pull direction).
  *
- * `group_allowlist` is UNIONED with `groups`: the server keeps the two in separate
- * columns and an id can be allowlisted with no per-group row yet (the UI's
- * "add group" path). Adopting only `groups` would drop that id and make the agent
- * refuse a group the settings page shows as allowed. The synthesized entry matches
- * config-events.ts's own group_allowlist_changed default, `{mode:'mention',
- * allowFrom:['*']}`.
+ * Membership derivation depends on the scope, because the server keeps allowlist
+ * membership and per-group settings in two columns with different lifetimes:
  *
- * A missing `group_scope` falls back to 'allowlist', NOT to the server's own "open"
- * default: a malformed response must never widen the agent's group exposure.
+ * - Under 'allowlist' the `group_allowlist` column IS the authoritative membership list
+ *   and `groups[]` only supplies mode/allowFrom for ids on it. Unioning here would
+ *   resurrect a revoked group: cws-comm's UpdateGroupAllowlist("remove") drops the id
+ *   from the allowlist and LEAVES the per-group row (agent_policy_service.go — the
+ *   function contains no DeleteAgentGroupPolicies call), so the surviving row would put
+ *   the group straight back and the owner's revocation could never stick.
+ * - Under 'open'/'disabled' the allowlist is not a gate, so the two are unioned to keep
+ *   per-group modes that would otherwise be lost.
+ *
+ * An id allowlisted with no per-group row yet (the UI's "add group" path) is still
+ * adopted in both cases; its synthesized entry matches config-events.ts's own
+ * group_allowlist_changed default, `{mode:'mention', allowFrom:['*']}`.
+ *
+ * Every enum arrives through adoptEnum: absent, empty AND out-of-enum values all fall
+ * back to the local value, then to the conservative literal — never to the server's own
+ * wider default. A malformed response must never widen the agent's exposure.
  */
-export function adoptServerPolicy(snapshot: ServerPolicySnapshot | null | undefined): OrgAccess {
-	const groups: NonNullable<OrgAccess["groups"]> = {};
+export function adoptServerPolicy(snapshot: ServerPolicySnapshot | null | undefined, local: OrgAccess = {}): OrgAccess {
+	const groupPolicy = adoptEnum(VALID_GROUP_SCOPES, snapshot?.group_scope, local.groupPolicy, "allowlist");
+
+	// Per-group settings, keyed by conversation. Modes are clamped against the gate's enum
+	// and fall back to whatever this conversation already had locally.
+	const rows: NonNullable<OrgAccess["groups"]> = {};
 	for (const g of snapshot?.groups || []) {
 		const id = g?.conversation_id;
 		if (!id) continue;
-		groups[id] = { mode: g?.mode || "mention", allowFrom: normalizeAllowFrom(g?.allow_from) };
+		rows[id] = {
+			mode: adoptEnum(VALID_GROUP_MODES, g?.mode, local.groups?.[id]?.mode, "mention"),
+			allowFrom: normalizeAllowFrom(g?.allow_from),
+		};
 	}
-	for (const id of snapshot?.group_allowlist || []) {
-		if (id && !groups[id]) groups[id] = { mode: "mention", allowFrom: ["*"] };
-	}
+
+	const allowlist = (snapshot?.group_allowlist || []).filter(Boolean);
+	const ids = groupPolicy === "allowlist" ? allowlist : [...new Set([...Object.keys(rows), ...allowlist])];
+
+	const groups: NonNullable<OrgAccess["groups"]> = {};
+	for (const id of ids) groups[id] = rows[id] || { mode: "mention", allowFrom: ["*"] };
+
 	return {
-		dmPolicy: snapshot?.dm_policy || "owner",
+		dmPolicy: adoptEnum(VALID_DM_POLICIES, snapshot?.dm_policy, local.dmPolicy, "owner"),
 		dmAllowFrom: [...(snapshot?.dm_allowlist || [])],
-		groupPolicy: snapshot?.group_scope || "allowlist",
+		groupPolicy,
 		groups,
 	};
 }
@@ -199,7 +268,7 @@ export function accessFingerprint(access: OrgAccess = {}): string {
 interface PolicyMarker {
 	/** accessFingerprint of the local block at that point. */
 	fp: string;
-	/** The snapshot's `updated_at` (unix millis) at that point; 0 when no row existed. */
+	/** The snapshot's `updated_at` normalised to a comparable number; 0 when no row existed. */
 	serverUpdatedAt: number;
 }
 
@@ -365,8 +434,11 @@ export function makeReconcilePolicy(
 			return "skipped:get-failed";
 		}
 
-		const serverUpdatedAt = Number(snapshot?.updated_at) || 0;
-		const serverGroups = (snapshot?.groups || []).length + (snapshot?.group_allowlist || []).length;
+		const serverUpdatedAt = normalizeUpdatedAt(snapshot?.updated_at);
+		// dm_allowlist counts too: a DM-only row is a real row, and mistaking it for "no row"
+		// would authorise a push over it.
+		const serverGroups =
+			(snapshot?.groups || []).length + (snapshot?.group_allowlist || []).length + (snapshot?.dm_allowlist || []).length;
 		const marker = markers.get(orgId);
 
 		// (4) ASSUMPTION (server implementation detail, not a contract guarantee): cws-core
@@ -382,7 +454,7 @@ export function makeReconcilePolicy(
 		// (5) The server row moved since we last looked → the server is authoritative
 		// (someone edited it in the UI) → adopt it locally and do NOT push.
 		if (serverUpdatedAt !== marker?.serverUpdatedAt) {
-			const adopted = adoptServerPolicy(snapshot);
+			const adopted = adoptServerPolicy(snapshot, orgConfig.access || {});
 			const adoptedFp = accessFingerprint(adopted);
 			if (adoptedFp !== accessFingerprint(orgConfig.access || {})) {
 				// Write to BOTH the persisted record and the SDK's live orgConfig, as an
