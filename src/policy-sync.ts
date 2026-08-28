@@ -102,8 +102,18 @@ export type ReconcileOutcome =
 	| "noop";
 
 /**
- * Group modes the REPORT endpoint accepts. Deliberately NOT the local
- * config-events.ts VALID_GROUP_MODES, which also contains 'silent': cws-comm's
+ * Group modes that are meaningful end to end — used on BOTH directions, for two reasons
+ * that happen to select the same pair.
+ *
+ * Enforcement: decideInbound special-cases mode === 'mention' and nothing else, so 'smart'
+ * and 'mention' are the only modes the gate can act on. This is why the SDK's own
+ * VALID_GROUP_MODES is the wrong set to clamp an ADOPTED mode against: it contains
+ * 'silent', which the gate does not implement, so a stored 'silent' behaves like 'smart'
+ * and answers every message — the clamp would fire for values nobody sends and no-op for
+ * the one the server actually sends (cws-core does store 'silent'; config-events.ts:21
+ * accepts it on the push channel and drops the entry rather than storing the mode).
+ *
+ * Reporting: cws-comm's
  * ReportPolicy validates every group's mode against smart|mention and returns an
  * InputError for the FIRST offender, which fails the WHOLE report (400) — one silent
  * group would sink the entire snapshot. Such a group is therefore dropped from `groups`
@@ -118,7 +128,7 @@ export type ReconcileOutcome =
  * preserved entry would answer everything in a group the owner silenced, which is worse
  * than the group falling out of the allowlist.
  */
-const REPORTABLE_GROUP_MODES = new Set(["smart", "mention"]);
+const ENFORCEABLE_GROUP_MODES = new Set(["smart", "mention"]);
 
 /**
  * Wire form of "everyone in this group may trigger me".
@@ -139,6 +149,11 @@ const REPORTABLE_GROUP_MODES = new Set(["smart", "mention"]);
  * prevent. Only equality and zero-ness are ever compared, so the unit does not matter;
  * being parseable does.
  */
+/** Tolerate a non-array container: the module header promises nothing here throws. */
+function arr<T>(v: unknown): T[] {
+	return Array.isArray(v) ? (v as T[]) : [];
+}
+
 function normalizeUpdatedAt(v: unknown): number {
 	if (typeof v === "number") return Number.isFinite(v) ? v : 0;
 	if (typeof v === "string" && v.trim()) {
@@ -186,7 +201,7 @@ export function buildReportedPolicy(access: OrgAccess = {}): ReportedPolicy {
 			mode: cfg?.mode || "mention",
 			allow_from: normalizeAllowFrom(cfg?.allowFrom),
 		}))
-		.filter((g) => REPORTABLE_GROUP_MODES.has(g.mode))
+		.filter((g) => ENFORCEABLE_GROUP_MODES.has(g.mode))
 		// Sorted so the body (and therefore the fingerprint) is a deterministic function
 		// of the access block, independent of key insertion order.
 		.sort((a, b) => (a.conversation_id < b.conversation_id ? -1 : a.conversation_id > b.conversation_id ? 1 : 0));
@@ -228,16 +243,16 @@ export function adoptServerPolicy(snapshot: ServerPolicySnapshot | null | undefi
 	// Per-group settings, keyed by conversation. Modes are clamped against the gate's enum
 	// and fall back to whatever this conversation already had locally.
 	const rows: NonNullable<OrgAccess["groups"]> = {};
-	for (const g of snapshot?.groups || []) {
+	for (const g of arr<{ conversation_id?: string; mode?: string; allow_from?: string[] }>(snapshot?.groups)) {
 		const id = g?.conversation_id;
 		if (!id) continue;
 		rows[id] = {
-			mode: adoptEnum(VALID_GROUP_MODES, g?.mode, local.groups?.[id]?.mode, "mention"),
+			mode: adoptEnum(ENFORCEABLE_GROUP_MODES, g?.mode, local.groups?.[id]?.mode, "mention"),
 			allowFrom: normalizeAllowFrom(g?.allow_from),
 		};
 	}
 
-	const allowlist = (snapshot?.group_allowlist || []).filter(Boolean);
+	const allowlist = arr<string>(snapshot?.group_allowlist).filter(Boolean);
 	const ids = groupPolicy === "allowlist" ? allowlist : [...new Set([...Object.keys(rows), ...allowlist])];
 
 	const groups: NonNullable<OrgAccess["groups"]> = {};
@@ -245,7 +260,7 @@ export function adoptServerPolicy(snapshot: ServerPolicySnapshot | null | undefi
 
 	return {
 		dmPolicy: adoptEnum(VALID_DM_POLICIES, snapshot?.dm_policy, local.dmPolicy, "owner"),
-		dmAllowFrom: [...(snapshot?.dm_allowlist || [])],
+		dmAllowFrom: [...arr<string>(snapshot?.dm_allowlist)],
 		groupPolicy,
 		groups,
 	};
@@ -438,7 +453,7 @@ export function makeReconcilePolicy(
 		// dm_allowlist counts too: a DM-only row is a real row, and mistaking it for "no row"
 		// would authorise a push over it.
 		const serverGroups =
-			(snapshot?.groups || []).length + (snapshot?.group_allowlist || []).length + (snapshot?.dm_allowlist || []).length;
+			arr(snapshot?.groups).length + arr(snapshot?.group_allowlist).length + arr(snapshot?.dm_allowlist).length;
 		const marker = markers.get(orgId);
 
 		// (4) ASSUMPTION (server implementation detail, not a contract guarantee): cws-core

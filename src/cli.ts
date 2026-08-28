@@ -190,8 +190,15 @@ async function cmdStart(): Promise<void> {
 	let requestStop: (() => void) | null = null;
 	let stopRequested = false;
 	const onSignal = () => {
-		if (requestStop) requestStop();
-		else stopRequested = true;
+		if (requestStop) return requestStop();
+		if (stopRequested) {
+			// Second signal while the bootstrap round-trip is still in flight. The SDK's HTTP
+			// client uses bare fetch with no AbortSignal, so a hung socket would otherwise leave
+			// both Ctrl+C and SIGTERM unanswered for as long as it hangs.
+			log("[codex-openmax] second signal during bootstrap — exiting without a graceful stop");
+			process.exit(130);
+		}
+		stopRequested = true;
 	};
 	process.on("SIGINT", onSignal);
 	process.on("SIGTERM", onSignal);

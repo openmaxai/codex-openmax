@@ -226,6 +226,38 @@ describe("adoptServerPolicy — 拉取方向", () => {
 		expect((await gate(adopted, ["me"])).handle).toBe(false);
 	});
 
+	it("服务端下发的 mode:'silent' 不许原样落地——SDK 的闸没有 silent 分支,它会表现得和 smart 一样、每条都回", async () => {
+		const local: OrgAccess = { dmPolicy: "owner", dmAllowFrom: [], groupPolicy: "allowlist", groups: { c_x: { mode: "mention", allowFrom: ["*"] } } };
+		const adopted = adoptServerPolicy(
+			{ group_scope: "allowlist", groups: [{ conversation_id: "c_x", mode: "silent", allow_from: ["*"] }], group_allowlist: ["c_x"], updated_at: 1 },
+			local,
+		);
+		expect(adopted.groups?.c_x?.mode).toBe("mention");
+		expect((await gate(adopted)).handle).toBe(false);
+		// 对照：silent 原样落地时,没被 @ 的消息也会被处理——owner 要的是静音,拿到的是最大参与度。
+		expect((await gate({ ...local, groups: { c_x: { mode: "silent", allowFrom: ["*"] } } })).handle).toBe(true);
+	});
+
+	it("服务端没给 mode 时退回本地值,但本地值同样要过闸的集合（本地 silent 也得夹成 mention）", async () => {
+		const keep = adoptServerPolicy(
+			{ group_scope: "allowlist", groups: [{ conversation_id: "c_x", allow_from: ["*"] }], group_allowlist: ["c_x"], updated_at: 1 },
+			{ groupPolicy: "allowlist", groups: { c_x: { mode: "smart", allowFrom: ["*"] } } },
+		);
+		expect(keep.groups?.c_x?.mode).toBe("smart");
+		const clamped = adoptServerPolicy(
+			{ group_scope: "allowlist", groups: [{ conversation_id: "c_x", allow_from: ["*"] }], group_allowlist: ["c_x"], updated_at: 1 },
+			{ groupPolicy: "allowlist", groups: { c_x: { mode: "silent", allowFrom: ["*"] } } },
+		);
+		expect(clamped.groups?.c_x?.mode).toBe("mention");
+		expect((await gate(clamped)).handle).toBe(false);
+	});
+
+	it("容器不是数组时不许抛——模块头承诺 nothing here throws,而 bootstrap 那个调用点没有 try", () => {
+		const bad = { group_scope: "allowlist", groups: {}, group_allowlist: "c_x", dm_allowlist: 7, updated_at: 1 } as never;
+		expect(() => adoptServerPolicy(bad)).not.toThrow();
+		expect(adoptServerPolicy(bad).groups).toEqual({});
+	});
+
 	it("open/disabled 模式下 allowlist 不是闸,仍应取并集以保住逐群 mode", () => {
 		const adopted = adoptServerPolicy({
 			group_scope: "open",

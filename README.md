@@ -123,7 +123,8 @@ codex-openmax report-policy
 
 That is a one-shot force push (local wins) and the only command that writes the policy without
 reading it first. It prints one JSON line (`{"ok":true,"orgs":{…}}`) and exits non-zero if any
-org failed. Reporting is best-effort throughout: a failure is logged and never interrupts
+org failed — or if there was no enabled org to report for, since a run that pushed nothing
+is not a successful push. Reporting is best-effort throughout: a failure is logged and never interrupts
 message handling.
 
 ### Running as a persistent service (optional)
