@@ -226,16 +226,23 @@ describe("adoptServerPolicy — 拉取方向", () => {
 		expect((await gate(adopted, ["me"])).handle).toBe(false);
 	});
 
-	it("服务端下发的 mode:'silent' 不许原样落地——SDK 的闸没有 silent 分支,它会表现得和 smart 一样、每条都回", async () => {
+	it("服务端下发的 mode:'silent' 必须删条目,与 WS 通道同一终态——保留它会每条都回,夹成 mention 会被 @ 就回,两者都违背 owner", async () => {
 		const local: OrgAccess = { dmPolicy: "owner", dmAllowFrom: [], groupPolicy: "allowlist", groups: { c_x: { mode: "mention", allowFrom: ["*"] } } };
 		const adopted = adoptServerPolicy(
 			{ group_scope: "allowlist", groups: [{ conversation_id: "c_x", mode: "silent", allow_from: ["*"] }], group_allowlist: ["c_x"], updated_at: 1 },
 			local,
 		);
-		expect(adopted.groups?.c_x?.mode).toBe("mention");
-		expect((await gate(adopted)).handle).toBe(false);
-		// 对照：silent 原样落地时,没被 @ 的消息也会被处理——owner 要的是静音,拿到的是最大参与度。
+		// 即使 c_x 仍在服务端的 group_allowlist 里,也不许合成一个默认条目把它放回来。
+		expect(adopted.groups).toEqual({});
+		const viaAdopt = await gate(adopted, ["me"]);
+		// config-events.ts:108 收到同一个值时是 delete 条目,终态必须逐字一致。
+		const viaWs = await gate({ ...local, groups: {} }, ["me"]);
+		expect(viaAdopt.handle).toBe(false);
+		expect(viaAdopt.reason).toBe(viaWs.reason);
+		// 对照一：原样保留 silent —— 没被 @ 也会回。
 		expect((await gate({ ...local, groups: { c_x: { mode: "silent", allowFrom: ["*"] } } })).handle).toBe(true);
+		// 对照二：夹成 mention —— 被 @ 就会回,而 owner 要的是静音。
+		expect((await gate({ ...local, groups: { c_x: { mode: "mention", allowFrom: ["*"] } } }, ["me"])).handle).toBe(true);
 	});
 
 	it("服务端没给 mode 时退回本地值,但本地值同样要过闸的集合（本地 silent 也得夹成 mention）", async () => {
@@ -268,6 +275,30 @@ describe("adoptServerPolicy — 拉取方向", () => {
 		expect(adopted.groupPolicy).toBe("open");
 		expect(Object.keys(adopted.groups || {}).sort()).toEqual(["c_x", "c_y"]);
 		expect(adopted.groups?.c_x?.mode).toBe("smart");
+	});
+});
+
+describe("makeReconcilePolicy — silent 的收敛性", () => {
+	it("owner 静默一个群后,连续三轮都必须停在「不参与」,且一次 PUT 都不发（错误状态会稳定驻留,正确状态也要稳定）", async () => {
+		// WS 事件已经正确清空了条目;服务端那边仍存着 silent,且 c_x 仍在 group_allowlist 里。
+		const { provider, org } = setup({ dmPolicy: "owner", dmAllowFrom: [], groupPolicy: "allowlist", groups: {} });
+		const { http, puts } = fakeHttp({
+			get: () => ({
+				dm_policy: "owner",
+				dm_allowlist: [],
+				group_scope: "allowlist",
+				groups: [{ conversation_id: "c_x", mode: "silent", allow_from: ["*"] }],
+				group_allowlist: ["c_x"],
+				updated_at: 4242,
+			}),
+		});
+		const reconcile = makeReconcilePolicy(http, provider, quietLog);
+		const outcomes = [await reconcile(org), await reconcile(org), await reconcile(org)];
+		expect(outcomes).toEqual(["adopted", "noop", "noop"]);
+		expect(org.access?.groups).toEqual({});
+		expect((await gate(org.access as OrgAccess, ["me"])).handle).toBe(false);
+		// 一次 PUT 都不发：服务端存的 silent 是 owner 的意图,不该被本地状态覆盖掉。
+		expect(puts).toEqual([]);
 	});
 });
 

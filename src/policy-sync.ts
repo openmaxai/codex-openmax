@@ -243,9 +243,21 @@ export function adoptServerPolicy(snapshot: ServerPolicySnapshot | null | undefi
 	// Per-group settings, keyed by conversation. Modes are clamped against the gate's enum
 	// and fall back to whatever this conversation already had locally.
 	const rows: NonNullable<OrgAccess["groups"]> = {};
+	// 'silent' is not a mode this side can store: the gate cannot enforce it, so keeping it
+	// verbatim answers everything and clamping it to 'mention' answers on @ — both contradict
+	// the owner. It is a DROP SIGNAL, exactly as config-events.ts:108 treats the same value
+	// arriving on the WS channel ("'silent' means don't participate → drop the entry"). Handled
+	// here rather than in adoptEnum because the conversation must also leave the membership set
+	// below: under allowlist scope the id is still sitting in the server's group_allowlist, and
+	// synthesising a default entry for it would put the group straight back.
+	const silenced = new Set<string>();
 	for (const g of arr<{ conversation_id?: string; mode?: string; allow_from?: string[] }>(snapshot?.groups)) {
 		const id = g?.conversation_id;
 		if (!id) continue;
+		if (g?.mode === "silent") {
+			silenced.add(id);
+			continue;
+		}
 		rows[id] = {
 			mode: adoptEnum(ENFORCEABLE_GROUP_MODES, g?.mode, local.groups?.[id]?.mode, "mention"),
 			allowFrom: normalizeAllowFrom(g?.allow_from),
@@ -253,7 +265,7 @@ export function adoptServerPolicy(snapshot: ServerPolicySnapshot | null | undefi
 	}
 
 	const allowlist = arr<string>(snapshot?.group_allowlist).filter(Boolean);
-	const ids = groupPolicy === "allowlist" ? allowlist : [...new Set([...Object.keys(rows), ...allowlist])];
+	const ids = (groupPolicy === "allowlist" ? allowlist : [...new Set([...Object.keys(rows), ...allowlist])]).filter((id) => !silenced.has(id));
 
 	const groups: NonNullable<OrgAccess["groups"]> = {};
 	for (const id of ids) groups[id] = rows[id] || { mode: "mention", allowFrom: ["*"] };
