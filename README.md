@@ -91,6 +91,42 @@ binary on `PATH`. Full field contract + security notes:
 Either way, to stop it: `Ctrl+C` the process (or `kill` its PID) in the terminal it's actually
 running in.
 
+### Access policy sync
+
+The `access` block in `config.json` (DM policy, DM allowlist, group scope, and per-group
+mode/allowFrom) is the policy the agent actually enforces; cws-core keeps its own copy so the
+workspace settings page can show and edit it. `start` reconciles the two — once at startup,
+then on the same 5-minute tick as the owner re-sync — and the reconcile is **pull-first**: it
+reads the server's policy first and only writes when that read proves writing is safe.
+
+| Server state | What the reconcile does |
+| --- | --- |
+| no policy row yet | pushes the local block (seeding — there is nothing to overwrite) |
+| changed since the previous round | **the server wins**: the snapshot is adopted into `config.json` *and* the live in-memory config; nothing is pushed |
+| unchanged, but the local block changed | pushes the local block |
+| already in agreement | writes nothing, sends nothing |
+| unreadable (the request failed) | skips the round — it never pushes into an unknown server state |
+
+An unconditional periodic push instead of this would erase whatever the server holds and the
+local block does not express — a group allowlist edited in the settings page would come back
+empty minutes later.
+
+**Deliberate tradeoff:** once cws-core holds a policy row, the server is authoritative, so
+hand-editing the `access` block of a *running* agent is overwritten by the next reconcile.
+Restarting does not help — a fresh process has no marker, so it adopts the server's row. The
+adapter has no config-file watcher and cannot tell a fresh human edit from a stale read, so
+making a local edit win is an explicit act:
+
+```bash
+codex-openmax report-policy
+```
+
+That is a one-shot force push (local wins) and the only command that writes the policy without
+reading it first. It prints one JSON line (`{"ok":true,"orgs":{…}}`) and exits non-zero if any
+org failed — or if there was no enabled org to report for, since a run that pushed nothing
+is not a successful push. Reporting is best-effort throughout: a failure is logged and never interrupts
+message handling.
+
 ### Running as a persistent service (optional)
 
 If you want `codex-openmax` to survive a reboot or keep running unattended, run `start` under
@@ -142,9 +178,10 @@ working directory the service starts from.
 ```
 src/
   index.ts               # entry: wire Bridge + Adapter, main(bridge)
-  cli.ts                 # `codex-openmax init` / `start`
+  cli.ts                 # `codex-openmax init` / `start` / `report-policy`
   onboarding.ts          # init plumbing: JWT exchange, self-hydration, 0600 config write
   config.ts              # config load/validate
+  policy-sync.ts         # pull-first access-policy reconcile with cws-core (see above)
   types.ts               # /wake /send contract types
   bridge/
     cws-bridge.ts        # CwsBridge interface (+ mock for tests)
